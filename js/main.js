@@ -6,9 +6,11 @@ import {
   SHEET_PRESETS, presetInUnits, fromPoints, toPoints, formatLength, UNIT_LABEL,
 } from './core/units.js';
 import { renderPartImage } from './core/importers.js';
+import { loadCustomPresets, saveCustomPresets } from './core/storage.js';
 
 const engine = new Engine();
 let currentSheet = 0;
+let customPresets = loadCustomPresets(); // user-saved sheet sizes
 const thumbCache = new Map();   // part.id -> HTMLImageElement (low-res list thumb)
 const previewCache = new Map(); // part.id -> HTMLImageElement (hi-res preview)
 const previewPending = new Set(); // part.ids whose hi-res render is in flight
@@ -18,7 +20,8 @@ const $ = (id) => document.getElementById(id);
 const els = {
   dropzone: $('dropzone'), fileInput: $('file-input'), pickBtn: $('pick-btn'),
   partsList: $('parts-list'), partsEmpty: $('parts-empty'),
-  presetSelect: $('preset-select'), sheetW: $('sheet-w'), sheetH: $('sheet-h'),
+  presetSelect: $('preset-select'), savePresetBtn: $('save-preset-btn'), deletePresetBtn: $('delete-preset-btn'),
+  sheetW: $('sheet-w'), sheetH: $('sheet-h'),
   units: $('units-select'), margin: $('margin'), gap: $('gap'), rotations: $('rotations'),
   cores: $('cores-select'), detail: $('detail-select'),
   startBtn: $('start-btn'), stopBtn: $('stop-btn'), exportBtn: $('export-btn'),
@@ -174,16 +177,37 @@ function escapeHtml(s) {
 }
 
 // --- settings -------------------------------------------------------------
+function presetOption(value, text) {
+  const opt = document.createElement('option');
+  opt.value = value; opt.textContent = text;
+  return opt;
+}
+
 function populatePresets() {
   els.presetSelect.innerHTML = '';
-  for (const p of SHEET_PRESETS) {
-    const opt = document.createElement('option');
-    opt.value = p.id; opt.textContent = p.name;
-    els.presetSelect.appendChild(opt);
+  const std = document.createElement('optgroup');
+  std.label = 'Standard sizes';
+  for (const p of SHEET_PRESETS) std.appendChild(presetOption(p.id, p.name));
+  els.presetSelect.appendChild(std);
+
+  if (customPresets.length) {
+    const grp = document.createElement('optgroup');
+    grp.label = 'My presets';
+    for (const p of customPresets) grp.appendChild(presetOption(p.id, p.name));
+    els.presetSelect.appendChild(grp);
   }
-  const custom = document.createElement('option');
-  custom.value = 'custom'; custom.textContent = 'Custom';
-  els.presetSelect.appendChild(custom);
+  els.presetSelect.appendChild(presetOption('custom', 'Custom'));
+}
+
+// Look up a preset by id in either the built-in or user-saved lists.
+function findPreset(id) {
+  return SHEET_PRESETS.find((p) => p.id === id) ||
+         customPresets.find((p) => p.id === id) || null;
+}
+
+// Delete is only meaningful for a currently-selected user preset.
+function updatePresetButtons() {
+  els.deletePresetBtn.disabled = !customPresets.some((p) => p.id === els.presetSelect.value);
 }
 
 function populateCores() {
@@ -210,18 +234,48 @@ function syncSettingsToUI() {
   els.cores.value = (s.cores == null ? 'auto' : String(s.cores));
   els.detail.value = s.detail || 'balanced';
   els.presetSelect.value = s.presetId || 'custom';
+  updatePresetButtons();
 }
 function round(v) { return Math.round(v * 1000) / 1000; }
 
 function wireSettings() {
   els.presetSelect.addEventListener('change', () => {
     const id = els.presetSelect.value;
-    if (id === 'custom') { engine.updateSettings({ presetId: 'custom' }); return; }
-    const preset = SHEET_PRESETS.find((p) => p.id === id);
+    if (id === 'custom') { engine.updateSettings({ presetId: 'custom' }); updatePresetButtons(); return; }
+    const preset = findPreset(id);
     if (!preset) return;
     const d = presetInUnits(preset, engine.settings.units);
     engine.updateSettings({ presetId: id, sheetW: round(d.w), sheetH: round(d.h) });
     syncSettingsToUI();
+  });
+
+  els.savePresetBtn.addEventListener('click', () => {
+    const w = round(engine.settings.sheetW);
+    const h = round(engine.settings.sheetH);
+    const units = engine.settings.units;
+    const suggested = `${w} × ${h} ${UNIT_LABEL[units] || units}`;
+    const name = (window.prompt('Name this preset:', suggested) || '').trim();
+    if (!name) return;
+    const preset = { id: 'user_' + Date.now().toString(36), name, w, h, units };
+    customPresets.push(preset);
+    saveCustomPresets(customPresets);
+    populatePresets();
+    engine.updateSettings({ presetId: preset.id });
+    els.presetSelect.value = preset.id;
+    updatePresetButtons();
+  });
+
+  els.deletePresetBtn.addEventListener('click', () => {
+    const id = els.presetSelect.value;
+    const idx = customPresets.findIndex((p) => p.id === id);
+    if (idx < 0) return;
+    customPresets.splice(idx, 1);
+    saveCustomPresets(customPresets);
+    populatePresets();
+    // The selected preset is gone; keep the current size but mark it Custom.
+    engine.updateSettings({ presetId: 'custom' });
+    els.presetSelect.value = 'custom';
+    updatePresetButtons();
   });
 
   els.units.addEventListener('change', () => {
@@ -252,7 +306,7 @@ function wireSettings() {
       const patch = { [key]: v };
       if (key === 'sheetW' || key === 'sheetH') patch.presetId = 'custom';
       engine.updateSettings(patch);
-      if (patch.presetId) els.presetSelect.value = 'custom';
+      if (patch.presetId) { els.presetSelect.value = 'custom'; updatePresetButtons(); }
     });
   }
   els.rotations.addEventListener('change', () => {
@@ -300,17 +354,29 @@ function wireDropzone() {
 }
 
 // --- nesting actions ------------------------------------------------------
+// Suggested export filename: the single part's name when there's just one,
+// otherwise a generic name; sanitized of characters illegal in filenames.
+function defaultExportName() {
+  const parts = engine.parts || [];
+  const named = parts.filter((p) => p.name);
+  const base = named.length === 1 ? named[0].name : 'easynest-imposition';
+  return `${base.replace(/[\\/:*?"<>|]+/g, '_').trim() || 'easynest-imposition'}.pdf`;
+}
+
 function wireActions() {
   els.startBtn.addEventListener('click', () => { clearMessages(); clearLog(); currentSheet = 0; engine.start(); });
   els.stopBtn.addEventListener('click', () => engine.stop());
   els.exportBtn.addEventListener('click', async () => {
     els.exportBtn.disabled = true;
-    addMessage('Building PDF…', 'ok');
     try {
-      const { warnings } = await engine.export();
+      const { warnings, cancelled } = await engine.export(defaultExportName());
       clearMessages();
-      addMessage('Exported PDF.', 'ok');
-      for (const w of warnings) addMessage(w, 'warn');
+      if (cancelled) {
+        addMessage('Export cancelled.', 'warn');
+      } else {
+        addMessage('Exported PDF.', 'ok');
+        for (const w of warnings) addMessage(w, 'warn');
+      }
     } catch (e) {
       addMessage(`Export failed: ${e.message || e}`, 'err');
     } finally {

@@ -84,10 +84,14 @@
     <section class="panel settings-panel">
       <h2>Sheet &amp; settings</h2>
 
-      <label class="field">
+      <div class="field">
         <span>Preset</span>
-        <select id="preset-select"></select>
-      </label>
+        <div class="preset-row">
+          <select id="preset-select"></select>
+          <button id="save-preset-btn" class="btn small" type="button" title="Save the current sheet size as a preset">Save</button>
+          <button id="delete-preset-btn" class="btn small" type="button" title="Delete the selected saved preset" disabled>Delete</button>
+        </div>
+      </div>
 
       <div class="field-row">
         <label class="field">

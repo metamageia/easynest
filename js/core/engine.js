@@ -4,7 +4,7 @@
 import { importFiles, resizePart } from './importers.js';
 import { loadSettings, saveSettings } from './storage.js';
 import { NestRunner, sheetToPoints, findUnplaceable } from './nest.js';
-import { exportLayout, downloadPdf } from './export.js';
+import { exportLayout, beginSave, writeSavedPdf } from './export.js';
 
 export class Engine {
   constructor() {
@@ -135,10 +135,13 @@ export class Engine {
     return !!(this.layout && this.layout.sheets && this.layout.sheets.length > 0);
   }
 
-  async export() {
+  async export(suggestedName = 'easynest-imposition.pdf') {
     if (!this.canExport()) throw new Error('No layout to export yet.');
+    // Open the save dialog first (within the caller's user gesture), then build.
+    const target = await beginSave(suggestedName);
+    if (target.mode === 'cancelled') return { warnings: [], cancelled: true };
     const { bytes, warnings } = await exportLayout(this.layout, this.layout.sheetPt);
-    downloadPdf(bytes);
-    return { warnings };
+    await writeSavedPdf(target, bytes);
+    return { warnings, cancelled: false };
   }
 }

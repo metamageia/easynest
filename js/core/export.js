@@ -127,3 +127,47 @@ export function downloadPdf(bytes, filename = 'easynest-imposition.pdf') {
   document.body.removeChild(a);
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
+
+function withPdfExt(name) {
+  return /\.pdf$/i.test(name) ? name : `${name}.pdf`;
+}
+
+// Saving is two-phase so the picker opens within the click's user activation —
+// building the PDF can take long enough to lose it, which makes the File System
+// Access picker throw. Call beginSave() first (inside the gesture), then build,
+// then writeSavedPdf().
+//
+// Returns a target describing where to write:
+//   { mode: 'fs', handle }   — user chose a location via the native save dialog
+//   { mode: 'download', name } — fallback: named download to the browser folder
+//   { mode: 'cancelled' }    — user dismissed the dialog
+export async function beginSave(suggestedName = 'easynest-imposition.pdf') {
+  if (window.showSaveFilePicker) {
+    try {
+      const handle = await window.showSaveFilePicker({
+        suggestedName,
+        types: [{ description: 'PDF document', accept: { 'application/pdf': ['.pdf'] } }],
+      });
+      return { mode: 'fs', handle };
+    } catch (e) {
+      if (e && e.name === 'AbortError') return { mode: 'cancelled' };
+      // Picker unavailable/blocked (e.g. a sandboxed iframe) — fall through.
+    }
+  }
+  // Fallback: at least let the user name the file (default autofilled). Choosing
+  // a folder isn't possible without the File System Access API, so it lands in
+  // the browser's download location.
+  const name = window.prompt('Save PDF as:', suggestedName);
+  if (name === null) return { mode: 'cancelled' };
+  return { mode: 'download', name: withPdfExt(name.trim() || suggestedName) };
+}
+
+export async function writeSavedPdf(target, bytes) {
+  if (target.mode === 'fs') {
+    const writable = await target.handle.createWritable();
+    await writable.write(bytes);
+    await writable.close();
+  } else if (target.mode === 'download') {
+    downloadPdf(bytes, target.name);
+  }
+}

@@ -47,3 +47,27 @@ export function saveSettings(settings) {
     console.warn('Could not save settings:', e);
   }
 }
+
+// User-defined sheet-size presets, persisted separately from the built-in list.
+// Each entry: { id, name, w, h, units }  (w/h in its own `units`, like SHEET_PRESETS).
+const PRESETS_KEY = 'easynest.presets.v1';
+
+export function loadCustomPresets() {
+  try {
+    const raw = localStorage.getItem(PRESETS_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch (e) {
+    console.warn('Could not load presets:', e);
+    return [];
+  }
+}
+
+export function saveCustomPresets(presets) {
+  try {
+    localStorage.setItem(PRESETS_KEY, JSON.stringify(presets));
+  } catch (e) {
+    console.warn('Could not save presets:', e);
+  }
+}
