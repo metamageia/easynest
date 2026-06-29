@@ -3,7 +3,7 @@
 
 import { Engine } from './core/engine.js';
 import {
-  SHEET_PRESETS, presetInUnits, fromPoints, toPoints, formatLength, UNIT_LABEL,
+  SHEET_PRESETS, presetInUnits, fromPoints, toPoints, UNIT_LABEL,
 } from './core/units.js';
 import { renderPartImage } from './core/importers.js';
 import { loadCustomPresets, saveCustomPresets } from './core/storage.js';
@@ -14,6 +14,9 @@ let customPresets = loadCustomPresets(); // user-saved sheet sizes
 const thumbCache = new Map();   // part.id -> HTMLImageElement (low-res list thumb)
 const previewCache = new Map(); // part.id -> HTMLImageElement (hi-res preview)
 const previewPending = new Set(); // part.ids whose hi-res render is in flight
+const aspectLocked = new Map(); // part.id -> bool (size-override aspect lock; default on)
+const isAspectLocked = (id) => (aspectLocked.has(id) ? aspectLocked.get(id) : true);
+const originalDims = new Map(); // part.id -> {width,height} in points, for size reset
 
 // --- element refs ---------------------------------------------------------
 const $ = (id) => document.getElementById(id);
@@ -100,16 +103,14 @@ function wireLog() {
 }
 
 // --- parts list -----------------------------------------------------------
-function dims(part) {
-  const u = UNIT_LABEL[engine.settings.units];
-  return `${formatLength(part.width, engine.settings.units)} × ${formatLength(part.height, engine.settings.units)} ${u}`;
-}
-
 function renderParts() {
   els.partsList.innerHTML = '';
   els.partsEmpty.style.display = engine.parts.length ? 'none' : 'block';
 
   for (const part of engine.parts) {
+    // Remember the imported size once, so it can be reset later.
+    if (!originalDims.has(part.id)) originalDims.set(part.id, { width: part.width, height: part.height });
+
     const li = document.createElement('li');
     li.className = 'part';
 
@@ -118,62 +119,159 @@ function renderParts() {
     thumb.src = part.thumbnail || '';
     thumb.alt = part.name;
 
-    const info = document.createElement('div');
-    info.className = 'info';
-    info.innerHTML =
-      `<div class="name" title="${escapeHtml(part.name)}">${escapeHtml(part.name)}</div>` +
-      `<div class="meta"><span class="kind-tag">${part.kind}</span> ${dims(part)}</div>`;
+    const body = document.createElement('div');
+    body.className = 'body';
+
+    // Head: name + kind tag + remove
+    const head = document.createElement('div');
+    head.className = 'part-head';
+    const name = document.createElement('div');
+    name.className = 'name'; name.title = part.name; name.textContent = part.name;
+    const kind = document.createElement('span');
+    kind.className = 'kind-tag'; kind.textContent = part.kind;
+    const remove = document.createElement('button');
+    remove.className = 'icon-btn remove'; remove.title = 'Remove part'; remove.textContent = '✕';
+    remove.addEventListener('click', () => engine.removePart(part.id));
+    head.append(name, kind, remove);
+    body.appendChild(head);
+
     if (part.sizing && (part.kind === 'raster' || part.kind === 'svg')) {
-      const dpiRow = document.createElement('div');
-      dpiRow.className = 'dpi-row';
-      dpiRow.innerHTML = `<span>DPI</span>`;
-      const dpiInput = document.createElement('input');
-      dpiInput.type = 'number'; dpiInput.min = '1'; dpiInput.step = '1';
-      dpiInput.value = Math.round(part.sizing.dpi || 300);
-      dpiInput.title = 'Assumed resolution — change to resize this part';
-      dpiInput.addEventListener('change', () => {
-        const dpi = parseFloat(dpiInput.value);
-        if (dpi > 0) engine.resizePart(part.id, { mode: 'dpi', dpi });
-      });
-      dpiRow.appendChild(dpiInput);
-      info.appendChild(dpiRow);
+      body.appendChild(buildDpiRow(part));
     }
+
+    // Controls: size override + quantity, bottom-aligned in one row.
+    const controls = document.createElement('div');
+    controls.className = 'part-controls';
+    controls.append(buildSizeField(part), buildQtyField(part));
+    body.appendChild(controls);
+
     for (const w of (part.warnings || [])) {
       const wEl = document.createElement('div');
       wEl.className = 'warn'; wEl.textContent = w;
-      info.appendChild(wEl);
+      body.appendChild(wEl);
     }
 
-    const controls = document.createElement('div');
-    controls.className = 'controls';
-    const qty = document.createElement('div');
-    qty.className = 'qty';
-    const minus = button('−', 'btn small');
-    const qtyInput = document.createElement('input');
-    qtyInput.type = 'number'; qtyInput.min = '0'; qtyInput.value = part.quantity;
-    const plus = button('+', 'btn small');
-    minus.addEventListener('click', () => engine.setQuantity(part.id, part.quantity - 1));
-    plus.addEventListener('click', () => engine.setQuantity(part.id, part.quantity + 1));
-    qtyInput.addEventListener('change', () => engine.setQuantity(part.id, parseInt(qtyInput.value, 10)));
-    qty.append(minus, qtyInput, plus);
-
-    const remove = document.createElement('button');
-    remove.className = 'icon-btn'; remove.title = 'Remove part'; remove.textContent = '✕';
-    remove.addEventListener('click', () => engine.removePart(part.id));
-
-    controls.append(qty, remove);
-    li.append(thumb, info, controls);
+    li.append(thumb, body);
     els.partsList.appendChild(li);
   }
 }
 
-function button(label, cls) {
-  const b = document.createElement('button');
-  b.className = cls; b.textContent = label;
-  return b;
+function buildDpiRow(part) {
+  const dpiRow = document.createElement('div');
+  dpiRow.className = 'dpi-row';
+  const lbl = document.createElement('span');
+  lbl.textContent = 'DPI';
+  const dpiInput = document.createElement('input');
+  dpiInput.type = 'number'; dpiInput.min = '1'; dpiInput.step = '1';
+  dpiInput.value = Math.round(part.sizing.dpi || 300);
+  dpiInput.title = 'Assumed resolution — change to resize this part';
+  dpiInput.addEventListener('change', () => {
+    const dpi = parseFloat(dpiInput.value);
+    if (dpi > 0) engine.resizePart(part.id, { mode: 'dpi', dpi });
+  });
+  dpiRow.append(lbl, dpiInput);
+  return dpiRow;
 }
-function escapeHtml(s) {
-  return String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+// A labelled control group: a small uppercase label over its control(s).
+function fieldGroup(labelText, ...controls) {
+  const group = document.createElement('div');
+  group.className = 'field-group';
+  const label = document.createElement('label');
+  label.className = 'field-label'; label.textContent = labelText;
+  group.append(label, ...controls);
+  return group;
+}
+
+function buildQtyField(part) {
+  const input = document.createElement('input');
+  input.className = 'qty-input';
+  input.type = 'number'; input.min = '0'; input.value = part.quantity;
+  input.addEventListener('change', () => engine.setQuantity(part.id, parseInt(input.value, 10)));
+  autosizeNumberInput(input);
+  return fieldGroup('Qty', input);
+}
+
+// Grow a number input's width to fit its value (so e.g. quantity 1 and 1000 are
+// both readable without a fixed-width box). padPx leaves room for padding +
+// the spinner buttons.
+function autosizeNumberInput(input, padPx = 36) {
+  const apply = () => {
+    const len = Math.max(1, String(input.value == null ? '' : input.value).length);
+    input.style.width = `calc(${len}ch + ${padPx}px)`;
+  };
+  input.addEventListener('input', apply);
+  apply();
+}
+
+// Editable physical-size override (width × height, active units) with an
+// aspect-ratio lock and a reset-to-imported-size button. Works for every part
+// kind, including vector PDFs.
+function buildSizeField(part) {
+  const units = engine.settings.units;
+  const row = document.createElement('div');
+  row.className = 'size-row';
+
+  const wIn = document.createElement('input');
+  wIn.type = 'number'; wIn.min = '0.01'; wIn.step = '0.01';
+  wIn.value = round(fromPoints(part.width, units));
+  wIn.title = 'Override width';
+
+  const x = document.createElement('span');
+  x.className = 'x'; x.textContent = '×';
+
+  const hIn = document.createElement('input');
+  hIn.type = 'number'; hIn.min = '0.01'; hIn.step = '0.01';
+  hIn.value = round(fromPoints(part.height, units));
+  hIn.title = 'Override height';
+
+  const unit = document.createElement('span');
+  unit.className = 'unit'; unit.textContent = UNIT_LABEL[units];
+
+  const lock = document.createElement('button');
+  lock.type = 'button';
+  lock.className = 'icon-btn lock' + (isAspectLocked(part.id) ? ' active' : '');
+  lock.textContent = '🔗';
+  lock.title = 'Lock aspect ratio';
+  lock.setAttribute('aria-pressed', String(isAspectLocked(part.id)));
+  lock.addEventListener('click', () => {
+    const next = !isAspectLocked(part.id);
+    aspectLocked.set(part.id, next);
+    lock.classList.toggle('active', next);
+    lock.setAttribute('aria-pressed', String(next));
+  });
+
+  const reset = document.createElement('button');
+  reset.type = 'button';
+  reset.className = 'icon-btn reset';
+  reset.textContent = '↺';
+  reset.title = 'Reset to imported size';
+  const orig = originalDims.get(part.id);
+  const atOriginal = orig &&
+    Math.abs(part.width - orig.width) < 1e-3 && Math.abs(part.height - orig.height) < 1e-3;
+  reset.disabled = !!atOriginal;
+  reset.addEventListener('click', () => {
+    const o = originalDims.get(part.id);
+    if (o) engine.resizePart(part.id, { mode: 'explicit', widthPt: o.width, heightPt: o.height });
+  });
+
+  wIn.addEventListener('change', () => {
+    const v = parseFloat(wIn.value);
+    if (!(v > 0)) { wIn.value = round(fromPoints(part.width, units)); return; }
+    const widthPt = toPoints(v, units);
+    const heightPt = isAspectLocked(part.id) ? widthPt * (part.height / part.width) : part.height;
+    engine.resizePart(part.id, { mode: 'explicit', widthPt, heightPt });
+  });
+  hIn.addEventListener('change', () => {
+    const v = parseFloat(hIn.value);
+    if (!(v > 0)) { hIn.value = round(fromPoints(part.height, units)); return; }
+    const heightPt = toPoints(v, units);
+    const widthPt = isAspectLocked(part.id) ? heightPt * (part.width / part.height) : part.width;
+    engine.resizePart(part.id, { mode: 'explicit', widthPt, heightPt });
+  });
+
+  row.append(wIn, x, hIn, unit, lock, reset);
+  return fieldGroup('Size', row);
 }
 
 // --- settings -------------------------------------------------------------

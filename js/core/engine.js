@@ -47,7 +47,10 @@ export class Engine {
   // override: { mode:'dpi', dpi } | { mode:'explicit', widthPt, heightPt }
   resizePart(id, override) {
     const part = this.parts.find((p) => p.id === id);
-    if (!part || !part.sizing) return;
+    if (!part) return;
+    // DPI resize needs the stored pixel/unit sizing; an explicit size override
+    // works on any part (including vector PDFs, which carry no `sizing`).
+    if (override.mode === 'dpi' && !part.sizing) return;
     resizePart(part, override);
     this.invalidateLayout();
     this.onChange();

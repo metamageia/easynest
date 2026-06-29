@@ -32,7 +32,9 @@ h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: v
   display: flex; align-items: center; justify-content: space-between;
   padding: 10px 16px; background: var(--panel); border-bottom: 1px solid var(--line);
 }
-.brand { display: flex; align-items: baseline; gap: 10px; }
+.brand { display: flex; align-items: center; gap: 10px; }
+.gh-link { display: inline-flex; align-items: center; color: var(--muted); transition: color .15s; }
+.gh-link:hover { color: var(--ink); }
 .logo { color: var(--accent); font-size: 18px; }
 .title { font-weight: 700; font-size: 16px; }
 .tagline { color: var(--muted); font-size: 12px; }
@@ -105,7 +107,7 @@ h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: v
 
 .parts-list { list-style: none; margin: 14px 0 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
 .part {
-  display: grid; grid-template-columns: 52px 1fr auto; gap: 10px; align-items: center;
+  display: grid; grid-template-columns: 52px 1fr; gap: 10px; align-items: start;
   background: var(--panel-2); border: 1px solid var(--line); border-radius: var(--radius); padding: 8px;
 }
 .part .thumb {
@@ -113,19 +115,34 @@ h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: v
   background-image: linear-gradient(45deg,#ddd 25%,transparent 25%),linear-gradient(-45deg,#ddd 25%,transparent 25%),linear-gradient(45deg,transparent 75%,#ddd 75%),linear-gradient(-45deg,transparent 75%,#ddd 75%);
   background-size: 12px 12px; background-position: 0 0,0 6px,6px -6px,-6px 0;
 }
-.part .info { min-width: 0; }
-.part .name { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.part .meta { font-size: 12px; color: var(--muted); }
-.part .kind-tag { font-size: 10px; text-transform: uppercase; letter-spacing: .05em; padding: 1px 5px; border-radius: 4px; background: #3a3f47; }
+.part .body { min-width: 0; display: flex; flex-direction: column; gap: 8px; }
+.part-head { display: flex; align-items: center; gap: 6px; }
+.part .name { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex: 1; min-width: 0; }
+.part .kind-tag { font-size: 10px; text-transform: uppercase; letter-spacing: .05em; padding: 1px 5px; border-radius: 4px; background: #3a3f47; color: var(--muted); }
 .part .warn { color: var(--warn); font-size: 11px; }
-.part .controls { display: flex; flex-direction: column; align-items: flex-end; gap: 6px; }
-.qty { display: flex; align-items: center; gap: 2px; }
-.qty button { width: 24px; height: 24px; }
-.qty input { width: 44px; text-align: center; }
-.icon-btn { background: none; border: none; color: var(--muted); cursor: pointer; font-size: 14px; padding: 2px; }
-.icon-btn:hover { color: var(--err); }
+
+/* Control groups (Size, Qty): a small label above the control(s). */
+.part-controls { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 14px; }
+.field-group { display: flex; flex-direction: column; gap: 4px; }
+.field-label { font-size: 10px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+
+.size-row { display: flex; align-items: center; gap: 4px; font-size: 11px; color: var(--muted); }
+.size-row input { width: 56px; padding: 5px 6px; text-align: center; }
+.size-row .x { opacity: .6; }
+.size-row .unit { min-width: 16px; }
+
+.qty-input { width: 48px; text-align: center; padding: 5px 6px; }
+
 .dpi-row { display: flex; align-items: center; gap: 4px; font-size: 11px; color: var(--muted); }
-.dpi-row input { width: 52px; }
+.dpi-row input { width: 56px; text-align: center; }
+
+/* Inline icon buttons (remove / aspect lock / reset). */
+.icon-btn { background: none; border: 1px solid transparent; color: var(--muted); cursor: pointer; font-size: 14px; padding: 3px 5px; border-radius: 6px; line-height: 1; }
+.icon-btn:hover:not(:disabled) { color: var(--ink); border-color: var(--line); }
+.icon-btn:disabled { opacity: .35; cursor: default; }
+.icon-btn.remove { margin-left: auto; }
+.icon-btn.remove:hover { color: var(--err); }
+.icon-btn.lock.active { color: var(--accent); border-color: var(--accent); background: rgba(79,157,255,.12); }
 
 /* Preview */
 .preview-panel { display: flex; flex-direction: column; }
