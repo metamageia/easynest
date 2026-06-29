@@ -20,7 +20,8 @@ import { PT_PER_IN, PT_PER_MM } from './units.js';
 
 const DEFAULT_DPI = 300;
 const TRACE_PX = 500;     // longest-side resolution used for outline tracing
-const THUMB_PX = 160;     // thumbnail longest side
+const THUMB_PX = 160;     // thumbnail longest side (parts list)
+const PREVIEW_PX = 1000;  // longest-side resolution for the crisp sheet preview
 
 let _idCounter = 0;
 function nextId() {
@@ -207,10 +208,10 @@ async function importSvg(file) {
 }
 
 // Rasterize an SVG string into a canvas via an <img> + blob URL.
-function rasterizeSvg(text, widthPt, heightPt) {
+function rasterizeSvg(text, widthPt, heightPt, px = TRACE_PX) {
   return new Promise((resolve) => {
     const aspect = heightPt / widthPt;
-    const cw = TRACE_PX, ch = Math.max(1, Math.round(TRACE_PX * aspect));
+    const cw = px, ch = Math.max(1, Math.round(px * aspect));
     const blob = new Blob([text], { type: 'image/svg+xml' });
     const url = URL.createObjectURL(blob);
     const img = new Image();
@@ -280,6 +281,66 @@ function loadRaster(bytes, mime) {
     img.onerror = () => { URL.revokeObjectURL(url); reject(new Error('Could not decode image')); };
     img.src = url;
   });
+}
+
+// ---------------------------------------------------------------------------
+// High-resolution preview render
+// ---------------------------------------------------------------------------
+//
+// The stored `thumbnail` is only THUMB_PX (160px) and upscales badly in the
+// sheet preview. This re-renders a part at preview resolution from its ORIGINAL
+// payload — PDFs through pdf.js, SVGs re-rasterized, rasters re-decoded — so the
+// preview reads like the (vector) export instead of a blurry thumbnail. Returns
+// a PNG dataURL, falling back to the existing thumbnail on any failure.
+
+// Decode raster bytes to a canvas at up to `longSidePx` (never upscales beyond
+// the source resolution — there's no detail to gain).
+function decodeRasterToCanvas(bytes, mime, longSidePx) {
+  return new Promise((resolve) => {
+    const blob = new Blob([bytes], { type: mime });
+    const url = URL.createObjectURL(blob);
+    const img = new Image();
+    img.onload = () => {
+      const scale = Math.min(1, longSidePx / Math.max(img.naturalWidth, img.naturalHeight));
+      const c = makeCanvas(img.naturalWidth * scale, img.naturalHeight * scale);
+      c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
+      URL.revokeObjectURL(url);
+      resolve(c);
+    };
+    img.onerror = () => { URL.revokeObjectURL(url); resolve(null); };
+    img.src = url;
+  });
+}
+
+export async function renderPartImage(part, longSidePx = PREVIEW_PX) {
+  try {
+    if (part.kind === 'pdf') {
+      const pdfjsLib = window.pdfjsLib;
+      // pdf.js may detach the parsed buffer, so hand it a private copy.
+      const task = pdfjsLib.getDocument({ data: part.payload.pdfBytes.slice() });
+      const pdf = await task.promise;
+      const page = await pdf.getPage(part.payload.pageIndex + 1);
+      const vp1 = page.getViewport({ scale: 1 });
+      const scale = longSidePx / Math.max(vp1.width, vp1.height);
+      const vp = page.getViewport({ scale });
+      const canvas = makeCanvas(vp.width, vp.height);
+      await page.render({ canvasContext: canvas.getContext('2d'), viewport: vp }).promise;
+      const url = canvas.toDataURL('image/png');
+      page.cleanup();
+      await pdf.cleanup();
+      return url;
+    }
+    if (part.kind === 'svg') {
+      const canvas = await rasterizeSvg(part.payload.svgText, part.width, part.height, longSidePx);
+      return canvas ? canvas.toDataURL('image/png') : part.thumbnail;
+    }
+    // raster
+    const canvas = await decodeRasterToCanvas(part.payload.rasterBytes, part.payload.mime, longSidePx);
+    return canvas ? canvas.toDataURL('image/png') : part.thumbnail;
+  } catch (e) {
+    console.warn('Hi-res preview render failed, using thumbnail:', part.name, e);
+    return part.thumbnail;
+  }
 }
 
 // ---------------------------------------------------------------------------

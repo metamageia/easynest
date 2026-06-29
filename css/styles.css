@@ -142,13 +142,17 @@ h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: v
 .preview-stats strong { color: var(--ink); }
 
 /* Settings */
-.field { display: flex; flex-direction: column; gap: 4px; margin-bottom: 12px; font-size: 12px; color: var(--muted); }
+/* min-width:0 lets the fields shrink below their content's intrinsic width so
+   number inputs and long-labelled selects don't force a horizontal scrollbar in
+   the fixed-width column. */
+.field { display: flex; flex-direction: column; gap: 4px; margin-bottom: 12px; font-size: 12px; color: var(--muted); min-width: 0; }
 .field-row { display: flex; gap: 8px; }
 .field-row .field { flex: 1; }
 .units-field { max-width: 70px; }
 input, select {
   background: var(--panel-2); color: var(--ink); border: 1px solid var(--line);
   border-radius: 6px; padding: 7px 8px; font-size: 13px;
+  width: 100%; min-width: 0;
 }
 input:focus, select:focus { outline: none; border-color: var(--accent); }
 

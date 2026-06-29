@@ -5,10 +5,13 @@ import { Engine } from './core/engine.js';
 import {
   SHEET_PRESETS, presetInUnits, fromPoints, toPoints, formatLength, UNIT_LABEL,
 } from './core/units.js';
+import { renderPartImage } from './core/importers.js';
 
 const engine = new Engine();
 let currentSheet = 0;
-const thumbCache = new Map(); // part.id -> HTMLImageElement
+const thumbCache = new Map();   // part.id -> HTMLImageElement (low-res list thumb)
+const previewCache = new Map(); // part.id -> HTMLImageElement (hi-res preview)
+const previewPending = new Set(); // part.ids whose hi-res render is in flight
 
 // --- element refs ---------------------------------------------------------
 const $ = (id) => document.getElementById(id);
@@ -349,6 +352,23 @@ function loadThumb(part) {
   return img;
 }
 
+// Prefer a crisp, export-quality render of the part for the sheet preview,
+// rendered lazily and cached. While it's in flight, fall back to the low-res
+// list thumbnail so the preview is never empty; redraw once it's ready.
+function loadPreviewImage(part) {
+  const ready = previewCache.get(part.id);
+  if (ready) return ready;
+  if (!previewPending.has(part.id)) {
+    previewPending.add(part.id);
+    renderPartImage(part).then((url) => {
+      const img = new Image();
+      img.onload = () => { previewCache.set(part.id, img); drawPreview(); };
+      img.src = url || part.thumbnail || '';
+    }).catch(() => {}).finally(() => previewPending.delete(part.id));
+  }
+  return loadThumb(part);
+}
+
 function updateStats(layout) {
   if (!layout) {
     els.util.textContent = '—'; els.sheetCount.textContent = '—'; els.placedCount.textContent = '—';
@@ -380,12 +400,22 @@ function drawPreview() {
   const stage = canvas.parentElement.getBoundingClientRect();
   const pad = 16;
   const scale = Math.min((stage.width - pad) / sp.w, (stage.height - pad) / sp.h);
-  canvas.width = Math.max(1, Math.floor(sp.w * scale));
-  canvas.height = Math.max(1, Math.floor(sp.h * scale));
+
+  // Render at devicePixelRatio so outlines, the sheet edge, and part rasters are
+  // crisp on HiDPI displays (the backing store is larger than the CSS box; all
+  // drawing below stays in CSS pixels thanks to the matching ctx scale).
+  const dpr = window.devicePixelRatio || 1;
+  const cssW = Math.max(1, Math.floor(sp.w * scale));
+  const cssH = Math.max(1, Math.floor(sp.h * scale));
+  canvas.style.width = cssW + 'px';
+  canvas.style.height = cssH + 'px';
+  canvas.width = Math.round(cssW * dpr);
+  canvas.height = Math.round(cssH * dpr);
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
   // Sheet background
   ctx.fillStyle = '#ffffff';
-  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.fillRect(0, 0, cssW, cssH);
 
   // Margin (usable area) outline
   ctx.strokeStyle = 'rgba(79,157,255,.55)';
@@ -396,16 +426,16 @@ function drawPreview() {
   const placements = layout.sheets[currentSheet] || [];
   for (const pl of placements) {
     const part = pl.part;
-    const img = loadThumb(part);
+    const img = loadPreviewImage(part);
     ctx.save();
     ctx.translate((sp.margin + pl.x) * scale, (sp.margin + pl.y) * scale);
     ctx.rotate(pl.rotation * Math.PI / 180);
 
-    // Trace the true-shape outline (used both to clip the thumbnail and to
-    // stroke the boundary). The thumbnail is a rectangular raster of the
-    // artwork's bounding box; without clipping it to the real outline, vector
-    // parts that are nested gap-apart still look like they overlap because
-    // their bounding-box rectangles cover each other.
+    // Trace the true-shape outline (used both to clip the raster and to stroke
+    // the boundary). The part raster covers the artwork's rectangular bounding
+    // box; without clipping it to the real outline, vector parts that are nested
+    // gap-apart still look like they overlap because their bounding-box
+    // rectangles cover each other.
     const hasOutline = part.outline && part.outline.length > 2;
     if (hasOutline) {
       ctx.beginPath();
