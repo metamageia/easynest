@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>EasyNest — true-shape nesting for prepress</title>
+  <link rel="stylesheet" href="css/styles.css" />
+
+  <!-- Vendored browser bundles (no build step). These attach globals. -->
+  <script src="js/vendor/pdf-lib.min.js"></script>
+  <script src="js/vendor/pdfjs/pdf.min.js"></script>
+  <script>
+    // Point pdf.js at its worker bundle.
+    if (window.pdfjsLib) {
+      window.pdfjsLib.GlobalWorkerOptions.workerSrc = 'js/vendor/pdfjs/pdf.worker.min.js';
+    }
+  </script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">▦</span>
+      <span class="title">EasyNest</span>
+      <span class="tagline">true-shape nesting · vector &amp; spot-color safe</span>
+    </div>
+    <div class="topbar-actions">
+      <span id="status-pill" class="pill idle">Idle</span>
+    </div>
+  </header>
+
+  <main class="layout">
+    <!-- Parts panel -->
+    <section class="panel parts-panel">
+      <h2>Parts</h2>
+      <div id="dropzone" class="dropzone">
+        <p><strong>Drop files here</strong></p>
+        <p class="muted">PDF · SVG · PNG · JPG</p>
+        <button id="pick-btn" class="btn">Choose files…</button>
+        <input id="file-input" type="file" multiple accept=".pdf,.svg,.png,.jpg,.jpeg,application/pdf,image/svg+xml,image/png,image/jpeg" hidden />
+      </div>
+      <ul id="parts-list" class="parts-list"></ul>
+      <p id="parts-empty" class="muted empty-note">No parts yet. Drop files above to begin.</p>
+    </section>
+
+    <!-- Preview -->
+    <section class="panel preview-panel">
+      <div class="preview-header">
+        <h2>Sheet preview</h2>
+        <div class="sheet-pager">
+          <button id="prev-sheet" class="btn small" title="Previous sheet">‹</button>
+          <span id="sheet-label">— / —</span>
+          <button id="next-sheet" class="btn small" title="Next sheet">›</button>
+        </div>
+      </div>
+      <div class="preview-stage">
+        <canvas id="preview-canvas"></canvas>
+        <div id="preview-empty" class="preview-empty">
+          <p>Add parts, set your sheet, then <strong>Start Nest</strong>.</p>
+        </div>
+      </div>
+      <div class="preview-stats">
+        <span>Utilization: <strong id="util">—</strong></span>
+        <span>Sheets: <strong id="sheet-count">—</strong></span>
+        <span>Placed: <strong id="placed-count">—</strong></span>
+      </div>
+    </section>
+
+    <!-- Settings -->
+    <section class="panel settings-panel">
+      <h2>Sheet &amp; settings</h2>
+
+      <label class="field">
+        <span>Preset</span>
+        <select id="preset-select"></select>
+      </label>
+
+      <div class="field-row">
+        <label class="field">
+          <span>Width</span>
+          <input id="sheet-w" type="number" step="0.01" min="0.1" />
+        </label>
+        <label class="field">
+          <span>Height</span>
+          <input id="sheet-h" type="number" step="0.01" min="0.1" />
+        </label>
+        <label class="field units-field">
+          <span>Units</span>
+          <select id="units-select">
+            <option value="in">in</option>
+            <option value="mm">mm</option>
+          </select>
+        </label>
+      </div>
+
+      <div class="field-row">
+        <label class="field">
+          <span>Margin</span>
+          <input id="margin" type="number" step="0.01" min="0" />
+        </label>
+        <label class="field">
+          <span>Gap</span>
+          <input id="gap" type="number" step="0.01" min="0" />
+        </label>
+      </div>
+
+      <label class="field">
+        <span>Rotation steps <span class="muted">(free yield)</span></span>
+        <select id="rotations">
+          <option value="1">None (0°)</option>
+          <option value="2">2 (0/180°)</option>
+          <option value="4">4 (90°)</option>
+          <option value="8">8 (45°)</option>
+          <option value="12">12 (30°)</option>
+        </select>
+      </label>
+
+      <div class="actions">
+        <button id="start-btn" class="btn primary">Start Nest</button>
+        <button id="stop-btn" class="btn" disabled>Stop</button>
+        <button id="export-btn" class="btn export" disabled>Export PDF</button>
+      </div>
+
+      <div id="messages" class="messages"></div>
+    </section>
+  </main>
+
+  <script type="module" src="js/main.js"></script>
+</body>
+</html>
