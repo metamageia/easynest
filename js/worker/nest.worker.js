@@ -168,7 +168,7 @@ function computeNfp(pair, config) {
 
 // --- placement (ported from SVGnest placementworker.js) ------------------
 
-function placePaths(binPolygon, paths, config, nfpCache) {
+function placePaths(binPolygon, paths, config, nfpCache, onProgress) {
   if (!binPolygon) return null;
   const rotated = [];
   for (let i = 0; i < paths.length; i++) {
@@ -220,6 +220,7 @@ function placePaths(binPolygon, paths, config, nfpCache) {
         }
         placements.push(position);
         placed.push(path);
+        if (onProgress) onProgress(allplacements.concat([placements]));
         continue;
       }
 
@@ -299,7 +300,11 @@ function placePaths(binPolygon, paths, config, nfpCache) {
           }
         }
       }
-      if (position) { placed.push(path); placements.push(position); }
+      if (position) {
+        placed.push(path);
+        placements.push(position);
+        if (onProgress) onProgress(allplacements.concat([placements]));
+      }
     }
 
     if (minwidth) fitness += minwidth / binarea;
@@ -402,10 +407,21 @@ GeneticAlgorithm.prototype.randomWeightedIndividual = function (exclude) {
 };
 
 // --- worker driver --------------------------------------------------------
+//
+// A run is a SINGLE deterministic nesting pass (no continuous genetic loop):
+// build the area-sorted greedy ordering, compute its NFPs, place once, post the
+// result, and finish. Events are streamed to the main thread as `log` messages,
+// and each successful placement is streamed as a partial `placement` for a live
+// preview.
 
 let running = false;
 let tree = null, binPolygon = null, config = null;
-let GA = null, best = null, generations = 0;
+
+// Post a structured log line to the main thread.
+// level: 'info' | 'success' | 'warn' | 'error'
+function log(level, message) {
+  self.postMessage({ type: 'log', level, message });
+}
 
 function prepare(msg) {
   config = Object.assign({
@@ -457,71 +473,18 @@ function prepare(msg) {
   const bb = GeometryUtil.getPolygonBounds(binPolygon);
   binPolygon.width = bb.width;
   binPolygon.height = bb.height;
-
-  GA = null; best = null; generations = 0;
 }
 
-// Run one optimizer step: evaluate one individual, update best, post result.
-function step() {
-  if (!running) return;
-
-  if (GA === null) {
-    const adam = tree.slice(0);
-    adam.sort((a, b) => Math.abs(GeometryUtil.polygonArea(b)) - Math.abs(GeometryUtil.polygonArea(a)));
-    GA = new GeneticAlgorithm(adam, binPolygon, config);
-  }
-
-  let individual = null;
-  for (let i = 0; i < GA.population.length; i++) {
-    if (!GA.population[i].fitness) { individual = GA.population[i]; break; }
-  }
-  if (individual === null) {
-    GA.generation();
-    generations++;
-    individual = GA.population[1];
-  }
-
-  const placelist = individual.placement;
-  const rotations = individual.rotation;
-  for (let i = 0; i < placelist.length; i++) placelist[i].rotation = rotations[i];
-
-  // Build the NFP cache needed for this individual.
-  const nfpCache = {};
-  for (let i = 0; i < placelist.length; i++) {
-    const part = placelist[i];
-    let key = { A: -1, B: part.id, inside: true, Arotation: 0, Brotation: rotations[i] };
-    nfpCache[JSON.stringify(key)] = computeNfp({ A: binPolygon, B: part, key }, config);
-    for (let j = 0; j < i; j++) {
-      const placed = placelist[j];
-      key = { A: placed.id, B: part.id, inside: false, Arotation: rotations[j], Brotation: rotations[i] };
-      nfpCache[JSON.stringify(key)] = computeNfp({ A: placed, B: part, key }, config);
-    }
-  }
-
-  const result = placePaths(binPolygon, placelist.slice(0), config, nfpCache);
-  if (result && result.placements.length > 0) {
-    individual.fitness = result.fitness;
-
-    if (!best || result.fitness < best.fitness) {
-      best = result;
-      postBest();
-    }
-  } else {
-    individual.fitness = 1e9; // mark evaluated so the GA can move on
-  }
-
-  if (running) setTimeout(step, 0);
-}
-
-function postBest() {
-  // Utilization = placed part area / (bin area × sheets used).
+// Post a (partial or final) placement set with its utilization stats.
+// placements: [[{id,x,y,rotation}...], ...] per sheet.
+function postPlacement(placements, final) {
   let placedArea = 0;
-  const sheets = best.placements.length;
+  const sheets = placements.length;
   let numPlaced = 0;
   const treeAreas = tree.map((t) => Math.abs(GeometryUtil.polygonArea(t)));
-  for (let i = 0; i < best.placements.length; i++) {
-    for (let j = 0; j < best.placements[i].length; j++) {
-      placedArea += treeAreas[best.placements[i][j].id];
+  for (let i = 0; i < placements.length; i++) {
+    for (let j = 0; j < placements[i].length; j++) {
+      placedArea += treeAreas[placements[i][j].id];
       numPlaced++;
     }
   }
@@ -529,15 +492,78 @@ function postBest() {
 
   self.postMessage({
     type: 'placement',
-    placements: best.placements, // [[{id,x,y,rotation}...], ...] per sheet
+    placements,
     utilization: totalArea > 0 ? placedArea / totalArea : 0,
     sheets,
     placed: numPlaced,
     total: tree.length,
-    unplaced: best.unplaced,
-    fitness: best.fitness,
-    generations,
+    unplaced: tree.length - numPlaced,
+    final: !!final,
   });
+}
+
+// Run a single nesting pass: greedy area-sorted ordering, one placement.
+function runOnce() {
+  if (!running) return;
+  const n = tree.length;
+  log('info', `Starting nest — ${n} part${n === 1 ? '' : 's'}, up to ${Math.max(1, config.rotations)} rotation${config.rotations === 1 ? '' : 's'}.`);
+
+  // Largest-area-first ordering, with a seeded valid initial rotation per part.
+  const adam = tree.slice(0);
+  adam.sort((a, b) => Math.abs(GeometryUtil.polygonArea(b)) - Math.abs(GeometryUtil.polygonArea(a)));
+  const ga = new GeneticAlgorithm(adam, binPolygon, config);
+  const individual = ga.population[0];
+  const placelist = individual.placement;
+  const rotations = individual.rotation;
+  for (let i = 0; i < placelist.length; i++) placelist[i].rotation = rotations[i];
+
+  // Build the NFP cache for this ordering, logging parts that cannot fit.
+  log('info', `Computing no-fit polygons for ${placelist.length} part${placelist.length === 1 ? '' : 's'}…`);
+  const nfpCache = {};
+  for (let i = 0; i < placelist.length; i++) {
+    if (!running) return;
+    const part = placelist[i];
+    let key = { A: -1, B: part.id, inside: true, Arotation: 0, Brotation: rotations[i] };
+    const binNfp = computeNfp({ A: binPolygon, B: part, key }, config);
+    nfpCache[JSON.stringify(key)] = binNfp;
+    if (!binNfp || binNfp.length === 0) {
+      log('warn', `Part #${part.id} will not fit the usable sheet area at its chosen rotation.`);
+    }
+    for (let j = 0; j < i; j++) {
+      const placed = placelist[j];
+      key = { A: placed.id, B: part.id, inside: false, Arotation: rotations[j], Brotation: rotations[i] };
+      nfpCache[JSON.stringify(key)] = computeNfp({ A: placed, B: part, key }, config);
+    }
+  }
+  if (!running) return;
+
+  log('info', 'Placing parts…');
+  let result;
+  try {
+    result = placePaths(binPolygon, placelist.slice(0), config, nfpCache, (snapshot) => {
+      if (running) postPlacement(snapshot, false);
+    });
+  } catch (err) {
+    log('error', `Placement failed: ${err && err.message ? err.message : err}`);
+    running = false;
+    self.postMessage({ type: 'done', placed: 0, unplaced: n });
+    return;
+  }
+
+  if (result && result.placements.length > 0) {
+    postPlacement(result.placements, true);
+    const placed = n - result.unplaced;
+    const sheets = result.placements.length;
+    log('success', `Done — placed ${placed} of ${n} part${n === 1 ? '' : 's'} on ${sheets} sheet${sheets === 1 ? '' : 's'}.`);
+    if (result.unplaced > 0) {
+      log('warn', `${result.unplaced} part${result.unplaced === 1 ? '' : 's'} could not be placed on this sheet size.`);
+    }
+    self.postMessage({ type: 'done', placed, unplaced: result.unplaced });
+  } else {
+    log('error', 'No parts could be placed — check that parts fit within the sheet margins.');
+    self.postMessage({ type: 'done', placed: 0, unplaced: n });
+  }
+  running = false;
 }
 
 self.onmessage = function (e) {
@@ -545,7 +571,7 @@ self.onmessage = function (e) {
   if (msg.cmd === 'start') {
     prepare(msg);
     running = true;
-    setTimeout(step, 0);
+    setTimeout(runOnce, 0);
   } else if (msg.cmd === 'stop') {
     running = false;
   }

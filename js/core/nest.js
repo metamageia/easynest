@@ -106,8 +106,8 @@ export class NestRunner {
     this.running = false;
   }
 
-  // callbacks: { onPlacement(result), onError(err) }
-  // result: { sheets:[[{part,x,y,rotation}]], utilization, sheetCount, placed, total, unplaced, generations }
+  // callbacks: { onPlacement(result), onLog(entry), onDone(info), onError(err) }
+  // result: { sheets:[[{part,x,y,rotation}]], utilization, sheetCount, placed, total, unplaced, final }
   start({ parts, sheetPt, settings, seed }, callbacks) {
     this.stop();
     const { tree, bin, config, meta } = buildJob(parts, sheetPt, settings);
@@ -137,8 +137,13 @@ export class NestRunner {
           placed: msg.placed,
           total: msg.total,
           unplaced: msg.unplaced,
-          generations: msg.generations,
+          final: msg.final,
         });
+      } else if (msg.type === 'log') {
+        callbacks.onLog && callbacks.onLog({ level: msg.level, message: msg.message });
+      } else if (msg.type === 'done') {
+        this.running = false;
+        callbacks.onDone && callbacks.onDone({ placed: msg.placed, unplaced: msg.unplaced });
       }
     };
     this.worker.onerror = (e) => {

@@ -11,13 +11,14 @@ export class Engine {
     this.parts = [];
     this.settings = loadSettings();
     this.layout = null;            // last result from the optimizer
-    this.status = 'idle';          // 'idle' | 'nesting' | 'stopped'
+    this.status = 'idle';          // 'idle' | 'nesting' | 'done' | 'stopped'
     this.runner = new NestRunner();
     this.seed = 1;
     // UI hooks (set by main.js)
     this.onChange = () => {};       // parts/settings changed
     this.onStatus = () => {};       // nesting status changed
-    this.onProgress = () => {};     // new best layout / utilization
+    this.onProgress = () => {};     // new (partial or final) layout / utilization
+    this.onLog = () => {};          // a worker event-log line
   }
 
   // --- parts -------------------------------------------------------------
@@ -79,6 +80,15 @@ export class Engine {
         onPlacement: (result) => {
           this.layout = { ...result, sheetPt };
           this.onProgress(this.layout);
+        },
+        onLog: (entry) => this.onLog(entry),
+        onDone: (info) => {
+          // A single pass finished. Stay 'done' (not 'idle') so the result
+          // stands until parts/settings change.
+          if (this.status === 'nesting') {
+            this.status = 'done';
+            this.onStatus({ status: this.status, ...info });
+          }
         },
         onError: (err) => {
           this.status = 'idle';

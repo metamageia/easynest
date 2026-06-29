@@ -25,8 +25,23 @@
     </div>
     <div class="topbar-actions">
       <span id="status-pill" class="pill idle">Idle</span>
+      <button id="log-toggle" class="log-toggle" type="button" aria-expanded="false" title="Show event log">
+        <span class="log-toggle-label">▤ Log</span>
+        <span id="log-badge" class="log-badge" hidden>0</span>
+      </button>
     </div>
   </header>
+
+  <!-- Event/error log — hidden until toggled -->
+  <aside id="log-panel" class="log-panel" hidden>
+    <div class="log-panel-head">
+      <span>Event log</span>
+      <button id="log-clear" class="btn small" type="button">Clear</button>
+      <button id="log-close" class="icon-btn" type="button" title="Close">✕</button>
+    </div>
+    <ul id="log-list" class="log-list"></ul>
+    <p id="log-empty" class="muted log-empty">No events yet.</p>
+  </aside>
 
   <main class="layout">
     <!-- Parts panel -->

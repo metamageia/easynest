@@ -22,6 +22,8 @@ const els = {
   canvas: $('preview-canvas'), previewEmpty: $('preview-empty'),
   util: $('util'), sheetCount: $('sheet-count'), placedCount: $('placed-count'),
   prevSheet: $('prev-sheet'), nextSheet: $('next-sheet'), sheetLabel: $('sheet-label'),
+  logToggle: $('log-toggle'), logBadge: $('log-badge'), logPanel: $('log-panel'),
+  logList: $('log-list'), logEmpty: $('log-empty'), logClear: $('log-clear'), logClose: $('log-close'),
 };
 
 // --- messages -------------------------------------------------------------
@@ -31,6 +33,63 @@ function addMessage(text, kind = 'warn') {
   div.className = `msg ${kind}`;
   div.textContent = text;
   els.messages.appendChild(div);
+}
+
+// --- event log ------------------------------------------------------------
+let logUnread = 0;
+let logHasAlert = false;
+
+function timeLabel(d) {
+  return d.toLocaleTimeString([], { hour12: false });
+}
+
+function clearLog() {
+  els.logList.innerHTML = '';
+  els.logEmpty.style.display = 'block';
+  logUnread = 0; logHasAlert = false;
+  updateLogBadge();
+}
+
+function addLog(level, message) {
+  els.logEmpty.style.display = 'none';
+  const li = document.createElement('li');
+  li.className = `log-entry ${level}`;
+  const time = document.createElement('span');
+  time.className = 'log-time'; time.textContent = timeLabel(new Date());
+  const msg = document.createElement('span');
+  msg.className = 'log-msg'; msg.textContent = message;
+  li.append(time, msg);
+  els.logList.appendChild(li);
+  els.logList.scrollTop = els.logList.scrollHeight;
+
+  if (els.logPanel.hidden) {
+    logUnread++;
+    if (level === 'warn' || level === 'error') logHasAlert = true;
+    updateLogBadge();
+  }
+}
+
+function updateLogBadge() {
+  if (logUnread > 0) {
+    els.logBadge.hidden = false;
+    els.logBadge.textContent = logUnread > 99 ? '99+' : String(logUnread);
+    els.logBadge.classList.toggle('alert', logHasAlert);
+  } else {
+    els.logBadge.hidden = true;
+    els.logBadge.classList.remove('alert');
+  }
+}
+
+function setLogOpen(open) {
+  els.logPanel.hidden = !open;
+  els.logToggle.setAttribute('aria-expanded', String(open));
+  if (open) { logUnread = 0; logHasAlert = false; updateLogBadge(); }
+}
+
+function wireLog() {
+  els.logToggle.addEventListener('click', () => setLogOpen(els.logPanel.hidden));
+  els.logClose.addEventListener('click', () => setLogOpen(false));
+  els.logClear.addEventListener('click', clearLog);
 }
 
 // --- parts list -----------------------------------------------------------
@@ -216,7 +275,7 @@ function wireDropzone() {
 
 // --- nesting actions ------------------------------------------------------
 function wireActions() {
-  els.startBtn.addEventListener('click', () => { clearMessages(); currentSheet = 0; engine.start(); });
+  els.startBtn.addEventListener('click', () => { clearMessages(); clearLog(); currentSheet = 0; engine.start(); });
   els.stopBtn.addEventListener('click', () => engine.stop());
   els.exportBtn.addEventListener('click', async () => {
     els.exportBtn.disabled = true;
@@ -242,8 +301,9 @@ function wireActions() {
 // --- status ---------------------------------------------------------------
 function setStatus(info) {
   const s = info.status;
+  const labels = { nesting: 'Nesting…', done: 'Done', stopped: 'Stopped', idle: 'Idle' };
   els.statusPill.className = `pill ${s}`;
-  els.statusPill.textContent = s === 'nesting' ? 'Nesting…' : s === 'stopped' ? 'Stopped' : 'Idle';
+  els.statusPill.textContent = labels[s] || 'Idle';
   els.startBtn.disabled = s === 'nesting';
   els.stopBtn.disabled = s !== 'nesting';
   els.exportBtn.disabled = !engine.canExport();
@@ -350,6 +410,7 @@ engine.onProgress = (layout) => {
   els.exportBtn.disabled = !engine.canExport();
   drawPreview();
 };
+engine.onLog = (entry) => addLog(entry.level, entry.message);
 
 // --- init -----------------------------------------------------------------
 function init() {
@@ -361,6 +422,7 @@ function init() {
   wireSettings();
   wireDropzone();
   wireActions();
+  wireLog();
   renderParts();
   drawPreview();
   window.addEventListener('resize', drawPreview);
