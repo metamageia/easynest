@@ -108,16 +108,17 @@ function simplifyPolygon(polygon, tolPt, config) {
   return simplified;
 }
 
-function minkowskiDifference(A, B) {
+function minkowskiDifference(A, B, config) {
+  const scale = config.clipperScale;
   const Ac = toClipperCoordinates(A);
-  ClipperLib.JS.ScaleUpPath(Ac, 10000000);
+  ClipperLib.JS.ScaleUpPath(Ac, scale);
   const Bc = toClipperCoordinates(B);
-  ClipperLib.JS.ScaleUpPath(Bc, 10000000);
+  ClipperLib.JS.ScaleUpPath(Bc, scale);
   for (let i = 0; i < Bc.length; i++) { Bc[i].X *= -1; Bc[i].Y *= -1; }
   const solution = ClipperLib.Clipper.MinkowskiSum(Ac, Bc, true);
   let clipperNfp, largestArea = null;
   for (let i = 0; i < solution.length; i++) {
-    const n = toNestCoordinates(solution[i], 10000000);
+    const n = toNestCoordinates(solution[i], scale);
     const sarea = GeometryUtil.polygonArea(n);
     if (largestArea === null || largestArea > sarea) { clipperNfp = n; largestArea = sarea; }
   }
@@ -151,7 +152,7 @@ function computeNfp(pair, config) {
     if (searchEdges) {
       nfp = GeometryUtil.noFitPolygon(A, B, false, searchEdges);
     } else {
-      nfp = minkowskiDifference(A, B);
+      nfp = minkowskiDifference(A, B, config);
     }
     if (!nfp || nfp.length === 0) return null;
     for (let i = 0; i < nfp.length; i++) {
@@ -295,30 +296,47 @@ function placePaths(binPolygon, paths, config, nfpCache, onProgress) {
 
       // Choose the placement with the smallest weighted bounding box (gravity
       // toward the left edge), matching SVGnest's heuristic.
+      //
+      // The already-placed parts' extent is constant while we evaluate this one
+      // candidate, so accumulate its bounds ONCE here instead of rebuilding the
+      // full point list for every candidate NFP vertex (SVGnest's hot-loop
+      // waste — this is O(placedPoints) once, not per vertex).
+      let pminx = Infinity, pminy = Infinity, pmaxx = -Infinity, pmaxy = -Infinity;
+      for (let m = 0; m < placed.length; m++) {
+        for (let nn = 0; nn < placed[m].length; nn++) {
+          const px = placed[m][nn].x + placements[m].x;
+          const py = placed[m][nn].y + placements[m].y;
+          if (px < pminx) pminx = px;
+          if (px > pmaxx) pmaxx = px;
+          if (py < pminy) pminy = py;
+          if (py > pmaxy) pmaxy = py;
+        }
+      }
+
       let minarea = null, minx = null;
       for (let j = 0; j < finalNfp.length; j++) {
         const nf = finalNfp[j];
         if (Math.abs(GeometryUtil.polygonArea(nf)) < 2) continue;
         for (let k = 0; k < nf.length; k++) {
-          const allpoints = [];
-          for (let m = 0; m < placed.length; m++) {
-            for (let n = 0; n < placed[m].length; n++) {
-              allpoints.push({ x: placed[m][n].x + placements[m].x, y: placed[m][n].y + placements[m].y });
-            }
-          }
           const shiftvector = {
             x: nf[k].x - path[0].x, y: nf[k].y - path[0].y,
             id: path.id, rotation: path.rotation,
           };
+          // Extend the constant placed-parts bounds by this candidate's points.
+          let minX = pminx, minY = pminy, maxX = pmaxx, maxY = pmaxy;
           for (let m = 0; m < path.length; m++) {
-            allpoints.push({ x: path[m].x + shiftvector.x, y: path[m].y + shiftvector.y });
+            const x = path[m].x + shiftvector.x, y = path[m].y + shiftvector.y;
+            if (x < minX) minX = x;
+            if (x > maxX) maxX = x;
+            if (y < minY) minY = y;
+            if (y > maxY) maxY = y;
           }
-          const rectbounds = GeometryUtil.getPolygonBounds(allpoints);
-          const area = rectbounds.width * 2 + rectbounds.height;
+          const width = maxX - minX, height = maxY - minY;
+          const area = width * 2 + height;
           if (minarea === null || area < minarea ||
               (GeometryUtil.almostEqual(minarea, area) && (minx === null || shiftvector.x < minx))) {
             minarea = area;
-            minwidth = rectbounds.width;
+            minwidth = width;
             position = shiftvector;
             minx = shiftvector.x;
           }

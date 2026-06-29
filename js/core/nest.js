@@ -13,7 +13,21 @@
 
 import { toPoints } from './units.js';
 
-const CLIPPER_SCALE = 10000000;
+// ClipperLib runs on a fast double-precision path only while every scaled
+// coordinate stays under its loRange (~4.75e7, picked so coord² < 2^53); above
+// that it silently falls back to slow Int128 math. NFP + placement coordinates
+// reach roughly 3× the usable span (Minkowski ~2× a part, plus the placement
+// offset), so choose the LARGEST scale that keeps that bound under loRange to
+// maximise precision while staying on the fast path. If a sheet is so large the
+// clamp can't keep coordinates in range, ClipperLib still computes correctly —
+// just on the slow path, exactly as it did before this optimization.
+const CLIPPER_LO_RANGE = 47453132;
+const CLIPPER_MAX_SCALE = 10000000;
+function resolveClipperScale(sheetPt) {
+  const maxCoord = Math.max(1, 3 * (sheetPt.usableW + sheetPt.usableH));
+  const scale = Math.floor((CLIPPER_LO_RANGE * 0.85) / maxCoord);
+  return Math.min(CLIPPER_MAX_SCALE, Math.max(1000, scale));
+}
 
 // Build the optimizer job. Returns { tree, bin, config, meta } in a form that
 // survives structured-clone postMessage (plain objects, no array expandos —
@@ -48,7 +62,7 @@ export function buildJob(parts, sheetPt, settings) {
   };
 
   const config = {
-    clipperScale: CLIPPER_SCALE,
+    clipperScale: resolveClipperScale(sheetPt),
     curveTolerance: 0.3,
     spacing: sheetPt.gap,
     rotations: Math.max(1, settings.rotations || 4),
