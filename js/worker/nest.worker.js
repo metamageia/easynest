@@ -86,6 +86,19 @@ function polygonOffset(polygon, delta, config) {
   return toNestCoordinates(biggest, config.clipperScale);
 }
 
+// Reduce a polygon's vertex count by removing points closer than `tolPt` to
+// their neighbours (ClipperLib.CleanPolygon). Fewer vertices => much cheaper
+// NFP/Minkowski work. Used only for the throwaway nesting outline, so a little
+// looseness is acceptable. Returns the original on any degenerate result.
+function simplifyPolygon(polygon, tolPt, config) {
+  if (!tolPt || tolPt <= 0 || polygon.length < 4) return polygon;
+  const cp = toClipperCoordinates(polygon);
+  ClipperLib.JS.ScaleUpPath(cp, config.clipperScale);
+  const cleaned = ClipperLib.Clipper.CleanPolygon(cp, tolPt * config.clipperScale);
+  if (!cleaned || cleaned.length < 3) return polygon;
+  return toNestCoordinates(cleaned, config.clipperScale);
+}
+
 function minkowskiDifference(A, B) {
   const Ac = toClipperCoordinates(A);
   ClipperLib.JS.ScaleUpPath(Ac, 10000000);
@@ -194,13 +207,15 @@ function placePaths(binPolygon, paths, config, nfpCache, onProgress) {
     for (let i = 0; i < paths.length; i++) {
       const path = paths[i];
 
-      key = JSON.stringify({ A: -1, B: path.id, inside: true, Arotation: 0, Brotation: path.rotation });
+      // NFP cache keys are by SHAPE (source) + rotation, not per-copy id, so
+      // identical copies reuse the same NFP. Placement ids below stay per-copy.
+      key = JSON.stringify({ A: -1, B: path.source, inside: true, Arotation: 0, Brotation: path.rotation });
       const binNfp = nfpCache[key];
       if (!binNfp || binNfp.length === 0) continue; // unplaceable on an empty sheet
 
       let error = false;
       for (let j = 0; j < placed.length; j++) {
-        key = JSON.stringify({ A: placed[j].id, B: path.id, inside: false, Arotation: placed[j].rotation, Brotation: path.rotation });
+        key = JSON.stringify({ A: placed[j].source, B: path.source, inside: false, Arotation: placed[j].rotation, Brotation: path.rotation });
         if (!nfpCache[key]) { error = true; break; }
       }
       if (error) continue;
@@ -231,7 +246,7 @@ function placePaths(binPolygon, paths, config, nfpCache, onProgress) {
       let clipper = new ClipperLib.Clipper();
       const combinedNfp = new ClipperLib.Paths();
       for (let j = 0; j < placed.length; j++) {
-        key = JSON.stringify({ A: placed[j].id, B: path.id, inside: false, Arotation: placed[j].rotation, Brotation: path.rotation });
+        key = JSON.stringify({ A: placed[j].source, B: path.source, inside: false, Arotation: placed[j].rotation, Brotation: path.rotation });
         nfp = nfpCache[key];
         if (!nfp) continue;
         for (let k = 0; k < nfp.length; k++) {
@@ -426,6 +441,7 @@ const PARALLEL_MIN_JOBS = 48;
 
 let running = false;
 let tree = null, binPolygon = null, config = null;
+let sourcePoly = null;      // Map<sourceId, representativePolygon> for NFP compute
 let coreCount = 1;          // total cores this run may use (coordinator + helpers)
 let activeHelpers = [];     // live nested helper workers (for teardown)
 
@@ -449,6 +465,19 @@ function withDefaults(c) {
   }, c || {});
 }
 
+// Turn a raw source outline into its prepared nesting polygon: optional vertex
+// simplification, then the gap expansion, then CCW winding (as SVGnest expects).
+function prepareSourceOutline(rawPoly) {
+  let poly = rawPoly;
+  if (config.simplifyTol > 0) poly = simplifyPolygon(poly, config.simplifyTol, config);
+  if (config.spacing > 0) {
+    const off = polygonOffset(poly, 0.5 * config.spacing, config);
+    if (off && off.length >= 3) poly = off;
+  }
+  if (GeometryUtil.polygonArea(poly) > 0) poly = poly.slice().reverse();
+  return poly;
+}
+
 function prepare(msg) {
   config = withDefaults(msg.config);
 
@@ -460,36 +489,39 @@ function prepare(msg) {
   binPolygon.width = msg.bin.width;
   binPolygon.height = msg.bin.height;
 
+  // Prepare each distinct source outline ONCE (simplify + gap offset are the
+  // expensive steps), then hand every copy a thin array that shares the prepared
+  // point data but carries its own id/source/rotation tags.
+  const prepBySource = new Map();
   tree = msg.tree.map((item) => {
-    const poly = item.points.map((p) => ({ x: p.x, y: p.y }));
+    let base = prepBySource.get(item.source);
+    if (!base) {
+      const raw = item.points.map((p) => ({ x: p.x, y: p.y }));
+      base = prepareSourceOutline(raw);
+      prepBySource.set(item.source, base);
+    }
+    const poly = base.slice();        // distinct array, shared (read-only) points
     poly.id = item.id;
     poly.source = item.source;
     return poly;
   });
 
-  // Enforce the gap: expand each part by spacing/2 and inset the bin by
-  // spacing/2 so two placed outlines end up `spacing` apart.
+  // Inset the bin by gap/2 so two placed outlines end up `spacing` apart.
   if (config.spacing > 0) {
-    for (let i = 0; i < tree.length; i++) {
-      const src = tree[i];
-      const off = polygonOffset(src, 0.5 * config.spacing, config);
-      off.id = src.id; off.source = src.source;
-      tree[i] = off;
-    }
     const insetBin = polygonOffset(binPolygon, -0.5 * config.spacing, config);
     if (insetBin && insetBin.length >= 3) binPolygon = insetBin;
   }
   binPolygon.id = -1;
 
-  // Ensure consistent winding directions (CCW parts, CW bin), as SVGnest expects.
+  // Consistent winding (CW bin), and recompute bounds for the rectangle fast path.
   if (GeometryUtil.polygonArea(binPolygon) > 0) binPolygon.reverse();
-  for (let i = 0; i < tree.length; i++) {
-    if (GeometryUtil.polygonArea(tree[i]) > 0) tree[i].reverse();
-  }
-  // Recompute bin bounds used by the bin's inner-NFP rectangle fast path.
   const bb = GeometryUtil.getPolygonBounds(binPolygon);
   binPolygon.width = bb.width;
   binPolygon.height = bb.height;
+
+  // One representative polygon per source, for shape-keyed NFP computation.
+  sourcePoly = new Map();
+  for (const poly of tree) if (!sourcePoly.has(poly.source)) sourcePoly.set(poly.source, poly);
 }
 
 // Post a (partial or final) placement set with its utilization stats.
@@ -519,32 +551,42 @@ function postPlacement(placements, final) {
   });
 }
 
-function warnUnfit(id) {
-  log('warn', `Part #${id} will not fit the usable sheet area at its chosen rotation.`);
+function warnUnfit() {
+  log('warn', 'A part will not fit the usable sheet area at its chosen rotation.');
 }
 
 // The NFP key string MUST match the one placePaths looks up (same property
 // order): { A, B, inside, Arotation, Brotation }.
 function nfpKey(job) { return JSON.stringify(job); }
 
-// Every NFP needed to place `placelist` in order, as id+rotation descriptors.
+// Every DISTINCT NFP needed to place `placelist`, as shape(source)+rotation
+// descriptors. Because copies of a part share a shape, the job set is the cross
+// product of the distinct (source, rotation) combos present — not O(copies²).
 function buildNfpJobs(placelist) {
+  const combos = new Map(); // `${source}|${rot}` -> { source, rot }
+  for (const p of placelist) {
+    const k = p.source + '|' + p.rotation;
+    if (!combos.has(k)) combos.set(k, { source: p.source, rot: p.rotation });
+  }
+  const list = [...combos.values()];
+
   const jobs = [];
-  for (let i = 0; i < placelist.length; i++) {
-    const part = placelist[i];
-    jobs.push({ A: -1, B: part.id, inside: true, Arotation: 0, Brotation: part.rotation });
-    for (let j = 0; j < i; j++) {
-      const placed = placelist[j];
-      jobs.push({ A: placed.id, B: part.id, inside: false, Arotation: placed.rotation, Brotation: part.rotation });
+  const seen = new Set();
+  const add = (job) => { const ks = nfpKey(job); if (!seen.has(ks)) { seen.add(ks); jobs.push(job); } };
+  for (const b of list) {
+    add({ A: -1, B: b.source, inside: true, Arotation: 0, Brotation: b.rot });
+    for (const a of list) {
+      add({ A: a.source, B: b.source, inside: false, Arotation: a.rot, Brotation: b.rot });
     }
   }
   return jobs;
 }
 
-// Compute one NFP job against the current tree/bin (ids index `tree` directly).
+// Compute one NFP job. A/B are source ids (or -1 for the bin) resolved via the
+// per-source representative polygon.
 function computeJob(job) {
-  const A = job.A === -1 ? binPolygon : tree[job.A];
-  const B = tree[job.B];
+  const A = job.A === -1 ? binPolygon : sourcePoly.get(job.A);
+  const B = sourcePoly.get(job.B);
   return computeNfp({ A, B, key: job }, config);
 }
 
@@ -555,7 +597,7 @@ function buildNfpCache(jobs, helperCount, onComplete) {
   const computeInto = (job) => {
     const nfp = computeJob(job);
     cache[nfpKey(job)] = nfp;
-    if (job.inside && (!nfp || nfp.length === 0)) warnUnfit(job.B);
+    if (job.inside && (!nfp || nfp.length === 0)) warnUnfit();
   };
 
   // Single-core inline path.
@@ -585,7 +627,9 @@ function buildNfpCache(jobs, helperCount, onComplete) {
   const bucket = Array.from({ length: lanes }, () => []);
   for (let k = 0; k < jobs.length; k++) bucket[k % lanes].push(jobs[k]);
 
-  const serialTree = tree.map((t) => ({ points: t.map((p) => ({ x: p.x, y: p.y })), id: t.id }));
+  // Helpers only need the distinct prepared source shapes + the bin, not every copy.
+  const serialSources = [];
+  sourcePoly.forEach((poly, source) => serialSources.push({ source, points: poly.map((p) => ({ x: p.x, y: p.y })) }));
   const serialBin = { points: binPolygon.map((p) => ({ x: p.x, y: p.y })), width: binPolygon.width, height: binPolygon.height };
 
   let pending = helpers.length;
@@ -603,7 +647,7 @@ function buildNfpCache(jobs, helperCount, onComplete) {
       if (m.type !== 'nfpResults') return;
       for (let r = 0; r < m.results.length; r++) {
         cache[m.results[r].key] = m.results[r].nfp;
-        if (m.results[r].unfit != null) warnUnfit(m.results[r].unfit);
+        if (m.results[r].unfit) warnUnfit();
       }
       pending--; finish();
     };
@@ -614,7 +658,7 @@ function buildNfpCache(jobs, helperCount, onComplete) {
       for (let k = 0; k < lane.length; k++) computeInto(lane[k]);
       pending--; finish();
     };
-    w.postMessage({ cmd: 'helperInit', tree: serialTree, bin: serialBin, config });
+    w.postMessage({ cmd: 'helperInit', sources: serialSources, bin: serialBin, config });
     w.postMessage({ cmd: 'helperNfp', jobs: lane });
   });
 
@@ -686,25 +730,27 @@ function placeAndFinish(placelist, nfpCache, n) {
   running = false;
 }
 
-// Helper role: rebuild already-prepared geometry (no re-offset/re-winding —
-// the coordinator did that) so this instance can answer NFP job batches.
+// Helper role: rebuild the already-prepared source shapes + bin (no re-offset /
+// re-winding — the coordinator did that) so this instance can answer NFP jobs.
 function initHelper(msg) {
   config = withDefaults(msg.config);
   binPolygon = msg.bin.points.map((p) => ({ x: p.x, y: p.y }));
   binPolygon.width = msg.bin.width;
   binPolygon.height = msg.bin.height;
   binPolygon.id = -1;
-  tree = msg.tree.map((item) => {
-    const poly = item.points.map((p) => ({ x: p.x, y: p.y }));
-    poly.id = item.id;
-    return poly;
-  });
+  sourcePoly = new Map();
+  for (const s of msg.sources) {
+    const poly = s.points.map((p) => ({ x: p.x, y: p.y }));
+    poly.source = s.source;
+    sourcePoly.set(s.source, poly);
+  }
 }
 
 self.onmessage = function (e) {
   const msg = e.data;
   if (msg.cmd === 'start') {
     coreCount = Math.max(1, msg.cores | 0) || 1;
+    log('info', 'Preparing geometry…');
     prepare(msg);
     running = true;
     setTimeout(runOnce, 0);
@@ -714,11 +760,11 @@ self.onmessage = function (e) {
     const results = [];
     for (let k = 0; k < msg.jobs.length; k++) {
       const job = msg.jobs[k];
-      const A = job.A === -1 ? binPolygon : tree[job.A];
-      const B = tree[job.B];
+      const A = job.A === -1 ? binPolygon : sourcePoly.get(job.A);
+      const B = sourcePoly.get(job.B);
       const nfp = computeNfp({ A, B, key: job }, config);
       const out = { key: nfpKey(job), nfp };
-      if (job.inside && (!nfp || nfp.length === 0)) out.unfit = job.B;
+      if (job.inside && (!nfp || nfp.length === 0)) out.unfit = true;
       results.push(out);
     }
     self.postMessage({ type: 'nfpResults', results });

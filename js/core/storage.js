@@ -13,7 +13,8 @@ export const DEFAULT_SETTINGS = {
   gap: 0.125,
   rotations: 4,    // rotation granularity for the optimizer (1 = no rotation)
   presetId: '13x19',
-  cores: 'auto',   // parallel passes: 'auto' (= detected cores) or a positive integer
+  cores: 'auto',   // parallel NFP compute: 'auto' (= detected cores) or a positive integer
+  detail: 'balanced', // nesting outline detail: 'tight' | 'balanced' | 'fast'
 };
 
 export function loadSettings() {
@@ -39,6 +40,7 @@ export function saveSettings(settings) {
       rotations: settings.rotations,
       presetId: settings.presetId,
       cores: settings.cores,
+      detail: settings.detail,
     };
     localStorage.setItem(KEY, JSON.stringify(subset));
   } catch (e) {

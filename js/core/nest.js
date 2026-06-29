@@ -56,9 +56,22 @@ export function buildJob(parts, sheetPt, settings) {
     mutationRate: 10,
     useHoles: false,
     exploreConcave: false,
+    simplifyTol: detailToTolerance(settings.detail),
   };
 
   return { tree, bin, config, meta };
+}
+
+// Map the nesting-detail setting to an outline-simplification tolerance (points).
+// Higher tolerance => fewer outline vertices => faster NFP, slightly looser nests.
+// 'tight' keeps the full traced outline.
+export function detailToTolerance(detail) {
+  switch (detail) {
+    case 'fast': return 2.0;     // ~0.028in
+    case 'balanced': return 0.75; // ~0.010in
+    case 'tight': return 0;
+    default: return 0.75;
+  }
 }
 
 // Convert a sheet config (in display units) to points + usable area.

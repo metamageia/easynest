@@ -17,7 +17,7 @@ const els = {
   partsList: $('parts-list'), partsEmpty: $('parts-empty'),
   presetSelect: $('preset-select'), sheetW: $('sheet-w'), sheetH: $('sheet-h'),
   units: $('units-select'), margin: $('margin'), gap: $('gap'), rotations: $('rotations'),
-  cores: $('cores-select'),
+  cores: $('cores-select'), detail: $('detail-select'),
   startBtn: $('start-btn'), stopBtn: $('stop-btn'), exportBtn: $('export-btn'),
   statusPill: $('status-pill'), messages: $('messages'),
   canvas: $('preview-canvas'), previewEmpty: $('preview-empty'),
@@ -205,6 +205,7 @@ function syncSettingsToUI() {
   els.gap.value = round(s.gap);
   els.rotations.value = String(s.rotations);
   els.cores.value = (s.cores == null ? 'auto' : String(s.cores));
+  els.detail.value = s.detail || 'balanced';
   els.presetSelect.value = s.presetId || 'custom';
 }
 function round(v) { return Math.round(v * 1000) / 1000; }
@@ -257,6 +258,9 @@ function wireSettings() {
   els.cores.addEventListener('change', () => {
     const v = els.cores.value;
     engine.updateSettings({ cores: v === 'auto' ? 'auto' : (parseInt(v, 10) || 1) });
+  });
+  els.detail.addEventListener('change', () => {
+    engine.updateSettings({ detail: els.detail.value });
   });
 }
 
