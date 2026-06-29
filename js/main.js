@@ -17,6 +17,7 @@ const els = {
   partsList: $('parts-list'), partsEmpty: $('parts-empty'),
   presetSelect: $('preset-select'), sheetW: $('sheet-w'), sheetH: $('sheet-h'),
   units: $('units-select'), margin: $('margin'), gap: $('gap'), rotations: $('rotations'),
+  cores: $('cores-select'),
   startBtn: $('start-btn'), stopBtn: $('stop-btn'), exportBtn: $('export-btn'),
   statusPill: $('status-pill'), messages: $('messages'),
   canvas: $('preview-canvas'), previewEmpty: $('preview-empty'),
@@ -182,6 +183,19 @@ function populatePresets() {
   els.presetSelect.appendChild(custom);
 }
 
+function populateCores() {
+  const max = Engine.detectCores();
+  els.cores.innerHTML = '';
+  const auto = document.createElement('option');
+  auto.value = 'auto'; auto.textContent = `Auto (${max})`;
+  els.cores.appendChild(auto);
+  for (let n = 1; n <= max; n++) {
+    const opt = document.createElement('option');
+    opt.value = String(n); opt.textContent = n === 1 ? '1 (single)' : String(n);
+    els.cores.appendChild(opt);
+  }
+}
+
 function syncSettingsToUI() {
   const s = engine.settings;
   els.units.value = s.units;
@@ -190,6 +204,7 @@ function syncSettingsToUI() {
   els.margin.value = round(s.margin);
   els.gap.value = round(s.gap);
   els.rotations.value = String(s.rotations);
+  els.cores.value = (s.cores == null ? 'auto' : String(s.cores));
   els.presetSelect.value = s.presetId || 'custom';
 }
 function round(v) { return Math.round(v * 1000) / 1000; }
@@ -238,6 +253,10 @@ function wireSettings() {
   }
   els.rotations.addEventListener('change', () => {
     engine.updateSettings({ rotations: parseInt(els.rotations.value, 10) || 4 });
+  });
+  els.cores.addEventListener('change', () => {
+    const v = els.cores.value;
+    engine.updateSettings({ cores: v === 'auto' ? 'auto' : (parseInt(v, 10) || 1) });
   });
 }
 
@@ -418,6 +437,7 @@ function init() {
     addMessage('Failed to load PDF libraries. Serve the app over http(s), not file://.', 'err');
   }
   populatePresets();
+  populateCores();
   syncSettingsToUI();
   wireSettings();
   wireDropzone();

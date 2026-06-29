@@ -108,7 +108,7 @@ export class NestRunner {
 
   // callbacks: { onPlacement(result), onLog(entry), onDone(info), onError(err) }
   // result: { sheets:[[{part,x,y,rotation}]], utilization, sheetCount, placed, total, unplaced, final }
-  start({ parts, sheetPt, settings, seed }, callbacks) {
+  start({ parts, sheetPt, settings, seed, cores }, callbacks) {
     this.stop();
     const { tree, bin, config, meta } = buildJob(parts, sheetPt, settings);
     if (tree.length === 0) {
@@ -151,7 +151,7 @@ export class NestRunner {
       callbacks.onError && callbacks.onError(e);
     };
 
-    this.worker.postMessage({ cmd: 'start', tree, bin, config, seed });
+    this.worker.postMessage({ cmd: 'start', tree, bin, config, seed, cores: Math.max(1, cores | 0) || 1 });
     return true;
   }
 

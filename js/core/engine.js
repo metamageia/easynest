@@ -61,6 +61,23 @@ export class Engine {
     this.onChange();
   }
 
+  // Number of logical cores the host reports (>=1), used to resolve 'auto'.
+  static detectCores() {
+    const hc = (typeof navigator !== 'undefined' && navigator.hardwareConcurrency) || 0;
+    return Math.max(1, hc | 0);
+  }
+
+  // Resolve the cores setting ('auto' or an integer) to a concrete count,
+  // clamped to what the host actually has.
+  resolveCores() {
+    const max = Engine.detectCores();
+    const c = this.settings.cores;
+    if (c == null || c === 'auto') return max;
+    const n = parseInt(c, 10);
+    if (!isFinite(n) || n < 1) return 1;
+    return Math.min(n, max);
+  }
+
   // --- nesting -----------------------------------------------------------
   start() {
     const sheetPt = sheetToPoints(this.settings);
@@ -75,7 +92,7 @@ export class Engine {
     this.onStatus({ status: this.status, unplaceable });
 
     this.runner.start(
-      { parts: active, sheetPt, settings: this.settings, seed: this.seed },
+      { parts: active, sheetPt, settings: this.settings, seed: this.seed, cores: this.resolveCores() },
       {
         onPlacement: (result) => {
           this.layout = { ...result, sheetPt };

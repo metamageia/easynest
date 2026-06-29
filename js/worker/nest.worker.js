@@ -413,9 +413,21 @@ GeneticAlgorithm.prototype.randomWeightedIndividual = function (exclude) {
 // result, and finish. Events are streamed to the main thread as `log` messages,
 // and each successful placement is streamed as a partial `placement` for a live
 // preview.
+//
+// To make that one pass fast, the O(n²) no-fit-polygon precompute (the heavy,
+// embarrassingly-parallel part) is fanned out to nested instances of THIS SAME
+// script running in "helper" role; the coordinator assembles the results and
+// runs the inherently-serial placement itself. Nested workers aren't supported
+// everywhere, so spawning is guarded and degrades to a single-core inline build.
+
+// Below this many NFP jobs, parallelism isn't worth the worker startup +
+// data-transfer overhead, so we stay single-core regardless of the core setting.
+const PARALLEL_MIN_JOBS = 48;
 
 let running = false;
 let tree = null, binPolygon = null, config = null;
+let coreCount = 1;          // total cores this run may use (coordinator + helpers)
+let activeHelpers = [];     // live nested helper workers (for teardown)
 
 // Post a structured log line to the main thread.
 // level: 'info' | 'success' | 'warn' | 'error'
@@ -423,8 +435,9 @@ function log(level, message) {
   self.postMessage({ type: 'log', level, message });
 }
 
-function prepare(msg) {
-  config = Object.assign({
+// Merge caller config over engine defaults (shared by coordinator + helpers).
+function withDefaults(c) {
+  return Object.assign({
     clipperScale: 10000000,
     curveTolerance: 0.3,
     spacing: 0,
@@ -433,7 +446,11 @@ function prepare(msg) {
     mutationRate: 10,
     useHoles: false,
     exploreConcave: false,
-  }, msg.config || {});
+  }, c || {});
+}
+
+function prepare(msg) {
+  config = withDefaults(msg.config);
 
   _rand = (msg.seed != null) ? makeRng(msg.seed) : Math.random;
 
@@ -502,6 +519,115 @@ function postPlacement(placements, final) {
   });
 }
 
+function warnUnfit(id) {
+  log('warn', `Part #${id} will not fit the usable sheet area at its chosen rotation.`);
+}
+
+// The NFP key string MUST match the one placePaths looks up (same property
+// order): { A, B, inside, Arotation, Brotation }.
+function nfpKey(job) { return JSON.stringify(job); }
+
+// Every NFP needed to place `placelist` in order, as id+rotation descriptors.
+function buildNfpJobs(placelist) {
+  const jobs = [];
+  for (let i = 0; i < placelist.length; i++) {
+    const part = placelist[i];
+    jobs.push({ A: -1, B: part.id, inside: true, Arotation: 0, Brotation: part.rotation });
+    for (let j = 0; j < i; j++) {
+      const placed = placelist[j];
+      jobs.push({ A: placed.id, B: part.id, inside: false, Arotation: placed.rotation, Brotation: part.rotation });
+    }
+  }
+  return jobs;
+}
+
+// Compute one NFP job against the current tree/bin (ids index `tree` directly).
+function computeJob(job) {
+  const A = job.A === -1 ? binPolygon : tree[job.A];
+  const B = tree[job.B];
+  return computeNfp({ A, B, key: job }, config);
+}
+
+// Build the full NFP cache for `jobs`, optionally fanning out to `helperCount`
+// nested helper workers. Calls onComplete(cache) when every job is computed.
+function buildNfpCache(jobs, helperCount, onComplete) {
+  const cache = {};
+  const computeInto = (job) => {
+    const nfp = computeJob(job);
+    cache[nfpKey(job)] = nfp;
+    if (job.inside && (!nfp || nfp.length === 0)) warnUnfit(job.B);
+  };
+
+  // Single-core inline path.
+  if (helperCount <= 0) {
+    for (let k = 0; k < jobs.length; k++) {
+      if (!running) return;
+      computeInto(jobs[k]);
+    }
+    onComplete(cache);
+    return;
+  }
+
+  // Parallel path: spawn helpers (guarded — nested workers may be unsupported).
+  let helpers = [];
+  try {
+    for (let h = 0; h < helperCount; h++) helpers.push(new Worker(self.location.href));
+  } catch (err) {
+    for (const w of helpers) { try { w.terminate(); } catch (_) {} }
+    log('warn', 'Parallel cores unavailable here; computing on a single core.');
+    buildNfpCache(jobs, 0, onComplete);
+    return;
+  }
+  activeHelpers = helpers;
+
+  // Round-robin jobs into lanes; lane 0 is the coordinator, 1..n the helpers.
+  const lanes = helperCount + 1;
+  const bucket = Array.from({ length: lanes }, () => []);
+  for (let k = 0; k < jobs.length; k++) bucket[k % lanes].push(jobs[k]);
+
+  const serialTree = tree.map((t) => ({ points: t.map((p) => ({ x: p.x, y: p.y })), id: t.id }));
+  const serialBin = { points: binPolygon.map((p) => ({ x: p.x, y: p.y })), width: binPolygon.width, height: binPolygon.height };
+
+  let pending = helpers.length;
+  const finish = () => {
+    if (pending !== 0 || !running) return;
+    for (const w of helpers) { try { w.terminate(); } catch (_) {} }
+    activeHelpers = [];
+    onComplete(cache);
+  };
+
+  helpers.forEach((w, idx) => {
+    const lane = bucket[idx + 1];
+    w.onmessage = (e) => {
+      const m = e.data;
+      if (m.type !== 'nfpResults') return;
+      for (let r = 0; r < m.results.length; r++) {
+        cache[m.results[r].key] = m.results[r].nfp;
+        if (m.results[r].unfit != null) warnUnfit(m.results[r].unfit);
+      }
+      pending--; finish();
+    };
+    w.onerror = () => {
+      // Helper crashed — fold its lane back into the coordinator so the run
+      // still completes correctly, just slower.
+      try { w.terminate(); } catch (_) {}
+      for (let k = 0; k < lane.length; k++) computeInto(lane[k]);
+      pending--; finish();
+    };
+    w.postMessage({ cmd: 'helperInit', tree: serialTree, bin: serialBin, config });
+    w.postMessage({ cmd: 'helperNfp', jobs: lane });
+  });
+
+  // Coordinator computes lane 0 while the helpers run on their own threads.
+  // (Helper result messages queue until this synchronous loop yields.)
+  const myLane = bucket[0];
+  for (let k = 0; k < myLane.length; k++) {
+    if (!running) { for (const w of helpers) { try { w.terminate(); } catch (_) {} } return; }
+    computeInto(myLane[k]);
+  }
+  finish();
+}
+
 // Run a single nesting pass: greedy area-sorted ordering, one placement.
 function runOnce() {
   if (!running) return;
@@ -517,26 +643,20 @@ function runOnce() {
   const rotations = individual.rotation;
   for (let i = 0; i < placelist.length; i++) placelist[i].rotation = rotations[i];
 
-  // Build the NFP cache for this ordering, logging parts that cannot fit.
-  log('info', `Computing no-fit polygons for ${placelist.length} part${placelist.length === 1 ? '' : 's'}…`);
-  const nfpCache = {};
-  for (let i = 0; i < placelist.length; i++) {
-    if (!running) return;
-    const part = placelist[i];
-    let key = { A: -1, B: part.id, inside: true, Arotation: 0, Brotation: rotations[i] };
-    const binNfp = computeNfp({ A: binPolygon, B: part, key }, config);
-    nfpCache[JSON.stringify(key)] = binNfp;
-    if (!binNfp || binNfp.length === 0) {
-      log('warn', `Part #${part.id} will not fit the usable sheet area at its chosen rotation.`);
-    }
-    for (let j = 0; j < i; j++) {
-      const placed = placelist[j];
-      key = { A: placed.id, B: part.id, inside: false, Arotation: rotations[j], Brotation: rotations[i] };
-      nfpCache[JSON.stringify(key)] = computeNfp({ A: placed, B: part, key }, config);
-    }
-  }
-  if (!running) return;
+  const jobs = buildNfpJobs(placelist);
+  const helperCount = (coreCount > 1 && jobs.length >= PARALLEL_MIN_JOBS)
+    ? Math.min(coreCount - 1, jobs.length - 1) : 0;
+  log('info', `Computing ${jobs.length} no-fit polygon${jobs.length === 1 ? '' : 's'}` +
+    (helperCount > 0 ? ` across ${helperCount + 1} cores…` : ' on 1 core…'));
 
+  buildNfpCache(jobs, helperCount, (nfpCache) => {
+    if (!running) return;
+    placeAndFinish(placelist, nfpCache, n);
+  });
+}
+
+// Placement (serial) + result/done reporting.
+function placeAndFinish(placelist, nfpCache, n) {
   log('info', 'Placing parts…');
   let result;
   try {
@@ -566,13 +686,45 @@ function runOnce() {
   running = false;
 }
 
+// Helper role: rebuild already-prepared geometry (no re-offset/re-winding —
+// the coordinator did that) so this instance can answer NFP job batches.
+function initHelper(msg) {
+  config = withDefaults(msg.config);
+  binPolygon = msg.bin.points.map((p) => ({ x: p.x, y: p.y }));
+  binPolygon.width = msg.bin.width;
+  binPolygon.height = msg.bin.height;
+  binPolygon.id = -1;
+  tree = msg.tree.map((item) => {
+    const poly = item.points.map((p) => ({ x: p.x, y: p.y }));
+    poly.id = item.id;
+    return poly;
+  });
+}
+
 self.onmessage = function (e) {
   const msg = e.data;
   if (msg.cmd === 'start') {
+    coreCount = Math.max(1, msg.cores | 0) || 1;
     prepare(msg);
     running = true;
     setTimeout(runOnce, 0);
+  } else if (msg.cmd === 'helperInit') {
+    initHelper(msg);
+  } else if (msg.cmd === 'helperNfp') {
+    const results = [];
+    for (let k = 0; k < msg.jobs.length; k++) {
+      const job = msg.jobs[k];
+      const A = job.A === -1 ? binPolygon : tree[job.A];
+      const B = tree[job.B];
+      const nfp = computeNfp({ A, B, key: job }, config);
+      const out = { key: nfpKey(job), nfp };
+      if (job.inside && (!nfp || nfp.length === 0)) out.unfit = job.B;
+      results.push(out);
+    }
+    self.postMessage({ type: 'nfpResults', results });
   } else if (msg.cmd === 'stop') {
     running = false;
+    for (const w of activeHelpers) { try { w.terminate(); } catch (_) {} }
+    activeHelpers = [];
   }
 };
