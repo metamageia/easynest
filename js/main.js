@@ -400,18 +400,33 @@ function drawPreview() {
     ctx.save();
     ctx.translate((sp.margin + pl.x) * scale, (sp.margin + pl.y) * scale);
     ctx.rotate(pl.rotation * Math.PI / 180);
+
+    // Trace the true-shape outline (used both to clip the thumbnail and to
+    // stroke the boundary). The thumbnail is a rectangular raster of the
+    // artwork's bounding box; without clipping it to the real outline, vector
+    // parts that are nested gap-apart still look like they overlap because
+    // their bounding-box rectangles cover each other.
+    const hasOutline = part.outline && part.outline.length > 2;
+    if (hasOutline) {
+      ctx.beginPath();
+      ctx.moveTo(part.outline[0].x * scale, part.outline[0].y * scale);
+      for (let i = 1; i < part.outline.length; i++) ctx.lineTo(part.outline[i].x * scale, part.outline[i].y * scale);
+      ctx.closePath();
+    }
+
+    // Paint the thumbnail, clipped to the outline when we have one.
+    ctx.save();
+    if (hasOutline) ctx.clip();
     if (img && img.complete && img.naturalWidth) {
       ctx.drawImage(img, 0, 0, part.width * scale, part.height * scale);
     } else {
       ctx.fillStyle = 'rgba(120,140,170,.4)';
       ctx.fillRect(0, 0, part.width * scale, part.height * scale);
     }
-    // True-shape outline overlay
-    if (part.outline && part.outline.length > 2) {
-      ctx.beginPath();
-      ctx.moveTo(part.outline[0].x * scale, part.outline[0].y * scale);
-      for (let i = 1; i < part.outline.length; i++) ctx.lineTo(part.outline[i].x * scale, part.outline[i].y * scale);
-      ctx.closePath();
+    ctx.restore(); // drop the clip region before stroking
+
+    // True-shape outline overlay (current path survives the save/restore above).
+    if (hasOutline) {
       ctx.strokeStyle = 'rgba(40,60,90,.5)';
       ctx.lineWidth = 1;
       ctx.stroke();

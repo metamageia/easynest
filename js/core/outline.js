@@ -71,6 +71,34 @@ function dilate(mask, w, h, radius) {
   return out;
 }
 
+// Fill enclosed holes: any background region NOT reachable from the image
+// border is interior to some ink loop, so mark it solid. This is what makes a
+// thin cutline stroke behave as the part boundary — the cutline is a ring whose
+// interior (the gap to the logo, plus the logo itself) gets filled, fusing the
+// whole part into one solid silhouette. Without it, the thin ring has fewer
+// pixels than the logo fill and loses `largestComponent`, so the traced outline
+// shrinks to the logo and placed parts overlap at their true cutlines.
+function fillHoles(mask, w, h) {
+  const outside = new Uint8Array(w * h); // background cells reachable from border
+  const stack = [];
+  const visit = (idx) => { if (!mask[idx] && !outside[idx]) { outside[idx] = 1; stack.push(idx); } };
+
+  for (let x = 0; x < w; x++) { visit(x); visit((h - 1) * w + x); }
+  for (let y = 0; y < h; y++) { visit(y * w); visit(y * w + (w - 1)); }
+  while (stack.length) {
+    const idx = stack.pop();
+    const x = idx % w, y = (idx / w) | 0;
+    if (x > 0) visit(idx - 1);
+    if (x < w - 1) visit(idx + 1);
+    if (y > 0) visit(idx - w);
+    if (y < h - 1) visit(idx + w);
+  }
+
+  const out = new Uint8Array(w * h);
+  for (let i = 0; i < mask.length; i++) out[i] = (mask[i] || !outside[i]) ? 1 : 0;
+  return out;
+}
+
 // Keep only the largest 4-connected component. Returns { mask, start } where
 // start is the top-most/left-most solid pixel of that component, or null.
 function largestComponent(mask, w, h) {
@@ -199,9 +227,15 @@ export function traceOutline(imageData, opts) {
   const w = imageData.width, h = imageData.height;
   let mask = buildMask(imageData, w, h);
 
-  // Dilate proportionally to resolution to bridge thin gaps between ink.
+  // Dilate proportionally to resolution to bridge thin gaps between ink (e.g. a
+  // cutline stroke with small breaks, or separate glyphs).
   const dilateRadius = Math.max(1, Math.round(Math.min(w, h) * 0.01));
   mask = dilate(mask, w, h, dilateRadius);
+
+  // Fill enclosed regions so a thin cutline ring becomes a solid silhouette and
+  // wins component selection (otherwise the heavier logo fill inside it wins and
+  // the outline shrinks below the real cutline → overlapping placements).
+  mask = fillHoles(mask, w, h);
 
   const { mask: blob, start } = largestComponent(mask, w, h);
   if (!blob || !start) return null;
