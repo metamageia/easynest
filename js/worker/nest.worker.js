@@ -90,13 +90,22 @@ function polygonOffset(polygon, delta, config) {
 // their neighbours (ClipperLib.CleanPolygon). Fewer vertices => much cheaper
 // NFP/Minkowski work. Used only for the throwaway nesting outline, so a little
 // looseness is acceptable. Returns the original on any degenerate result.
+//
+// CleanPolygon can pull vertices INWARD (it cuts corners), which would undersize
+// a true-shape outline and let neighbours visually overlap. To guarantee the
+// simplified outline always *contains* the original, we grow it back outward by
+// the tolerance afterward — simplification may loosen the nest but can never
+// make placed parts collide.
 function simplifyPolygon(polygon, tolPt, config) {
   if (!tolPt || tolPt <= 0 || polygon.length < 4) return polygon;
   const cp = toClipperCoordinates(polygon);
   ClipperLib.JS.ScaleUpPath(cp, config.clipperScale);
   const cleaned = ClipperLib.Clipper.CleanPolygon(cp, tolPt * config.clipperScale);
   if (!cleaned || cleaned.length < 3) return polygon;
-  return toNestCoordinates(cleaned, config.clipperScale);
+  let simplified = toNestCoordinates(cleaned, config.clipperScale);
+  const grown = polygonOffset(simplified, tolPt, config);
+  if (grown && grown.length >= 3) simplified = grown;
+  return simplified;
 }
 
 function minkowskiDifference(A, B) {
@@ -435,9 +444,13 @@ GeneticAlgorithm.prototype.randomWeightedIndividual = function (exclude) {
 // runs the inherently-serial placement itself. Nested workers aren't supported
 // everywhere, so spawning is guarded and degrades to a single-core inline build.
 
-// Below this many NFP jobs, parallelism isn't worth the worker startup +
-// data-transfer overhead, so we stay single-core regardless of the core setting.
-const PARALLEL_MIN_JOBS = 48;
+// Parallelism gate. NFP cost scales with the PRODUCT of the two outlines'
+// vertex counts (Minkowski/NFP work is ~O(|A|·|B|)), so the expensive case is a
+// *few vector-heavy shapes*, not many simple ones. After shape de-dup the raw
+// job count is tiny, so gating on job count kept us single-core forever; gate on
+// estimated total vertex work instead. Below this, worker startup + data
+// transfer outweighs the compute, so we stay single-core regardless of setting.
+const PARALLEL_MIN_COST = 200000;
 
 let running = false;
 let tree = null, binPolygon = null, config = null;
@@ -582,6 +595,20 @@ function buildNfpJobs(placelist) {
   return jobs;
 }
 
+// Estimated cost of the whole job list, used to decide whether to fan out.
+// Each NFP is ~O(|A|·|B|) in the two outlines' vertex counts, so a handful of
+// dense vector shapes can dwarf dozens of rectangles. Summing the per-job
+// vertex products gives a gate that tracks real work, not de-duped job count.
+function estimateNfpCost(jobs) {
+  let cost = 0;
+  for (const job of jobs) {
+    const A = job.A === -1 ? binPolygon : sourcePoly.get(job.A);
+    const B = sourcePoly.get(job.B);
+    cost += (A ? A.length : 0) * (B ? B.length : 0);
+  }
+  return cost;
+}
+
 // Compute one NFP job. A/B are source ids (or -1 for the bin) resolved via the
 // per-source representative polygon.
 function computeJob(job) {
@@ -688,9 +715,9 @@ function runOnce() {
   for (let i = 0; i < placelist.length; i++) placelist[i].rotation = rotations[i];
 
   const jobs = buildNfpJobs(placelist);
-  const helperCount = (coreCount > 1 && jobs.length >= PARALLEL_MIN_JOBS)
+  const helperCount = (coreCount > 1 && jobs.length > 1 && estimateNfpCost(jobs) >= PARALLEL_MIN_COST)
     ? Math.min(coreCount - 1, jobs.length - 1) : 0;
-  log('info', `Computing ${jobs.length} no-fit polygon${jobs.length === 1 ? '' : 's'}` +
+  log('info', `Computing ${jobs.length} shape interaction${jobs.length === 1 ? '' : 's'} for ${n} part${n === 1 ? '' : 's'}` +
     (helperCount > 0 ? ` across ${helperCount + 1} cores…` : ' on 1 core…'));
 
   buildNfpCache(jobs, helperCount, (nfpCache) => {
