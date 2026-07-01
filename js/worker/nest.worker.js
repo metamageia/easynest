@@ -206,13 +206,12 @@ function placePaths(binPolygon, paths, config, nfpCache, onProgress) {
   const allplacements = [];
   let fitness = 0;
   const binarea = Math.abs(GeometryUtil.polygonArea(binPolygon));
-  let key, nfp, minwidth;
+  let key, nfp;
+  let lastSheetFill = 0; // normalized footprint of the most recently filled sheet
 
   while (paths.length > 0) {
     const placed = [];
     const placements = [];
-    fitness += 1; // each new sheet opened costs 1 (lower is better)
-    minwidth = null;
 
     for (let i = 0; i < paths.length; i++) {
       const path = paths[i];
@@ -336,7 +335,6 @@ function placePaths(binPolygon, paths, config, nfpCache, onProgress) {
           if (minarea === null || area < minarea ||
               (GeometryUtil.almostEqual(minarea, area) && (minx === null || shiftvector.x < minx))) {
             minarea = area;
-            minwidth = width;
             position = shiftvector;
             minx = shiftvector.x;
           }
@@ -349,18 +347,38 @@ function placePaths(binPolygon, paths, config, nfpCache, onProgress) {
       }
     }
 
-    if (minwidth) fitness += minwidth / binarea;
-
     for (let i = 0; i < placed.length; i++) {
       const index = paths.indexOf(placed[i]);
       if (index >= 0) paths.splice(index, 1);
     }
 
-    if (placements && placements.length > 0) allplacements.push(placements);
-    else break; // could not place anything more — avoid infinite loop
+    if (placements && placements.length > 0) {
+      // Footprint of this sheet: the bounding box that actually holds ink
+      // (width × height of everything placed) normalized by the usable area.
+      // A saturated sheet ≈ 1; a lightly-used one is a small fraction.
+      let sxmin = Infinity, symin = Infinity, sxmax = -Infinity, symax = -Infinity;
+      for (let m = 0; m < placed.length; m++) {
+        for (let nn = 0; nn < placed[m].length; nn++) {
+          const px = placed[m][nn].x + placements[m].x;
+          const py = placed[m][nn].y + placements[m].y;
+          if (px < sxmin) sxmin = px;
+          if (px > sxmax) sxmax = px;
+          if (py < symin) symin = py;
+          if (py > symax) symax = py;
+        }
+      }
+      lastSheetFill = ((sxmax - sxmin) * (symax - symin)) / binarea;
+      fitness += 1; // committing a sheet costs a whole unit of material…
+      allplacements.push(placements);
+    } else break; // could not place anything more — avoid infinite loop
   }
 
-  fitness += 2 * paths.length; // penalty for parts that could not be placed
+  // …except the LAST (partial) sheet, which costs only the material it actually
+  // uses. This rewards packing earlier sheets full and minimizing spill onto a
+  // fresh sheet — minimum waste per unit of material. Unplaced parts stay the
+  // worst outcome: penalized above the cost of opening a sheet to hold them.
+  if (allplacements.length > 0) fitness -= (1 - lastSheetFill);
+  fitness += 2 * paths.length;
   return { placements: allplacements, fitness, unplaced: paths.length, area: binarea };
 }
 
@@ -450,17 +468,21 @@ GeneticAlgorithm.prototype.randomWeightedIndividual = function (exclude) {
 
 // --- worker driver --------------------------------------------------------
 //
-// A run is a SINGLE deterministic nesting pass (no continuous genetic loop):
-// build the area-sorted greedy ordering, compute its NFPs, place once, post the
-// result, and finish. Events are streamed to the main thread as `log` messages,
-// and each successful placement is streamed as a partial `placement` for a live
-// preview.
+// A run is a genetic search: seed the population with the area-sorted greedy
+// ordering, precompute the NFP cache ONCE (all sources × all rotations), then
+// evolve — placing each candidate ordering/rotation against that shared cache,
+// keeping the best, and streaming the best-so-far layout as it improves. It
+// stops on convergence (STALL_LIMIT stale generations), a generation cap, or an
+// explicit `stop`. Each streamed layout is a complete, exportable result.
 //
-// To make that one pass fast, the O(n²) no-fit-polygon precompute (the heavy,
-// embarrassingly-parallel part) is fanned out to nested instances of THIS SAME
-// script running in "helper" role; the coordinator assembles the results and
-// runs the inherently-serial placement itself. Nested workers aren't supported
-// everywhere, so spawning is guarded and degrades to a single-core inline build.
+// The whole reason multi-start beats a single greedy pass cheaply is that the
+// O(n²) no-fit-polygon precompute (the heavy, embarrassingly-parallel part)
+// depends only on (source, rotation) — NOT on ordering — so it's paid once and
+// reused across every candidate. That precompute is fanned out to nested
+// instances of THIS SAME script running in "helper" role; the coordinator
+// assembles the results and runs the serial placement/evolution itself. Nested
+// workers aren't supported everywhere, so spawning is guarded and degrades to a
+// single-core inline build.
 
 // Parallelism gate. NFP cost scales with the PRODUCT of the two outlines'
 // vertex counts (Minkowski/NFP work is ~O(|A|·|B|)), so the expensive case is a
@@ -470,11 +492,25 @@ GeneticAlgorithm.prototype.randomWeightedIndividual = function (exclude) {
 // transfer outweighs the compute, so we stay single-core regardless of setting.
 const PARALLEL_MIN_COST = 200000;
 
+// Evolution stopping rule (convergence): quit once a full generation fails to
+// improve the best layout for STALL_LIMIT consecutive generations. GENERATION_CAP
+// is a hard safety net so a slowly-creeping fitness can't run forever; the user's
+// Stop button ends it any time in between. Lower fitness is better.
+const STALL_LIMIT = 8;
+const GENERATION_CAP = 100;
+
 let running = false;
 let tree = null, binPolygon = null, config = null;
 let sourcePoly = null;      // Map<sourceId, representativePolygon> for NFP compute
 let coreCount = 1;          // total cores this run may use (coordinator + helpers)
 let activeHelpers = [];     // live nested helper workers (for teardown)
+
+// Evolution state (set up in startEvolution, advanced in evalNext).
+let ga = null;              // the running GeneticAlgorithm
+let gaCache = null;         // shared NFP cache reused by every candidate
+let gaN = 0;                // total parts, for done-reporting
+let gaBestFitness = Infinity, gaBestPlacements = null, gaBestUnplaced = 0;
+let gaGen = 0, gaStall = 0, gaGenImproved = false;
 
 // Post a structured log line to the main thread.
 // level: 'info' | 'success' | 'warn' | 'error'
@@ -590,16 +626,26 @@ function warnUnfit() {
 // order): { A, B, inside, Arotation, Brotation }.
 function nfpKey(job) { return JSON.stringify(job); }
 
-// Every DISTINCT NFP needed to place `placelist`, as shape(source)+rotation
-// descriptors. Because copies of a part share a shape, the job set is the cross
-// product of the distinct (source, rotation) combos present — not O(copies²).
-function buildNfpJobs(placelist) {
-  const combos = new Map(); // `${source}|${rot}` -> { source, rot }
-  for (const p of placelist) {
-    const k = p.source + '|' + p.rotation;
-    if (!combos.has(k)) combos.set(k, { source: p.source, rot: p.rotation });
+// The discrete rotation angles the GA may assign a part: i·(360/rotations).
+function rotationAngles() {
+  const r = Math.max(1, config.rotations);
+  const angles = [];
+  for (let i = 0; i < r; i++) angles.push(i * (360 / r));
+  return angles;
+}
+
+// Every DISTINCT NFP the evolution could ever need, as shape(source)+rotation
+// descriptors. The GA freely mutates BOTH ordering and per-part rotation across
+// generations, so the cache must cover the full cross product of distinct
+// sources × all rotation angles — not just the combos in the initial ordering.
+// Copies of a part share a shape, so this stays O(sources²·rotations²), not
+// O(copies²), and it's paid once then reused by every candidate placement.
+function buildNfpJobs() {
+  const angles = rotationAngles();
+  const list = []; // { source, rot }
+  for (const source of sourcePoly.keys()) {
+    for (const rot of angles) list.push({ source, rot });
   }
-  const list = [...combos.values()];
 
   const jobs = [];
   const seen = new Set();
@@ -717,57 +763,102 @@ function buildNfpCache(jobs, helperCount, onComplete) {
   finish();
 }
 
-// Run a single nesting pass: greedy area-sorted ordering, one placement.
+// Build the GA population + the shared NFP cache, then kick off the evolution.
 function runOnce() {
   if (!running) return;
   const n = tree.length;
   log('info', `Starting nest — ${n} part${n === 1 ? '' : 's'}, up to ${Math.max(1, config.rotations)} rotation${config.rotations === 1 ? '' : 's'}.`);
 
-  // Largest-area-first ordering, with a seeded valid initial rotation per part.
+  // Largest-area-first ordering seeds population[0]; the rest are mutations of it.
   const adam = tree.slice(0);
   adam.sort((a, b) => Math.abs(GeometryUtil.polygonArea(b)) - Math.abs(GeometryUtil.polygonArea(a)));
-  const ga = new GeneticAlgorithm(adam, binPolygon, config);
-  const individual = ga.population[0];
-  const placelist = individual.placement;
-  const rotations = individual.rotation;
-  for (let i = 0; i < placelist.length; i++) placelist[i].rotation = rotations[i];
+  ga = new GeneticAlgorithm(adam, binPolygon, config);
 
-  const jobs = buildNfpJobs(placelist);
+  const jobs = buildNfpJobs();
   const helperCount = (coreCount > 1 && jobs.length > 1 && estimateNfpCost(jobs) >= PARALLEL_MIN_COST)
     ? Math.min(coreCount - 1, jobs.length - 1) : 0;
   log('info', `Computing ${jobs.length} shape interaction${jobs.length === 1 ? '' : 's'} for ${n} part${n === 1 ? '' : 's'}` +
     (helperCount > 0 ? ` across ${helperCount + 1} cores…` : ' on 1 core…'));
 
-  buildNfpCache(jobs, helperCount, (nfpCache) => {
+  buildNfpCache(jobs, helperCount, (cache) => {
     if (!running) return;
-    placeAndFinish(placelist, nfpCache, n);
+    startEvolution(cache, n);
   });
 }
 
-// Placement (serial) + result/done reporting.
-function placeAndFinish(placelist, nfpCache, n) {
+// --- evolution loop -------------------------------------------------------
+// A candidate placement is synchronous and can be slow, so we score exactly ONE
+// individual per macrotask (setTimeout 0). Yielding between them lets `stop`
+// messages land and lets the main thread paint each streamed best-so-far layout.
+
+function startEvolution(cache, n) {
+  gaCache = cache;
+  gaN = n;
+  gaBestFitness = Infinity;
+  gaBestPlacements = null;
+  gaBestUnplaced = n;
+  gaGen = 0;
+  gaStall = 0;
+  gaGenImproved = false;
   log('info', 'Placing parts…');
-  let result;
-  try {
-    result = placePaths(binPolygon, placelist.slice(0), config, nfpCache, (snapshot) => {
-      if (running) postPlacement(snapshot, false);
-    });
-  } catch (err) {
-    log('error', `Placement failed: ${err && err.message ? err.message : err}`);
-    running = false;
-    self.postMessage({ type: 'done', placed: 0, unplaced: n });
+  evalNext();
+}
+
+function evalNext() {
+  if (!running) return;
+
+  // First individual in the current generation not yet scored (elites keep their
+  // fitness across generations; freshly-bred children start undefined).
+  let ind = null;
+  for (let i = 0; i < ga.population.length; i++) {
+    if (ga.population[i].fitness === undefined) { ind = ga.population[i]; break; }
+  }
+
+  if (ind) {
+    // Stamp this individual's rotations onto the (shared) source polys, then place
+    // a throwaway copy of the ordering so its splices don't disturb the gene.
+    for (let i = 0; i < ind.placement.length; i++) ind.placement[i].rotation = ind.rotation[i];
+    let result;
+    try {
+      result = placePaths(binPolygon, ind.placement.slice(0), config, gaCache, null);
+    } catch (err) {
+      log('error', `Placement failed: ${err && err.message ? err.message : err}`);
+      running = false;
+      self.postMessage({ type: 'done', placed: 0, unplaced: gaN });
+      return;
+    }
+    ind.fitness = result.fitness;
+    if (result.placements.length > 0 && result.fitness < gaBestFitness) {
+      gaBestFitness = result.fitness;
+      gaBestPlacements = result.placements;
+      gaBestUnplaced = result.unplaced;
+      gaGenImproved = true;
+      postPlacement(gaBestPlacements, false); // complete, exportable best-so-far
+    }
+    setTimeout(evalNext, 0);
     return;
   }
 
-  if (result && result.placements.length > 0) {
-    postPlacement(result.placements, true);
-    const placed = n - result.unplaced;
-    const sheets = result.placements.length;
-    log('success', `Done — placed ${placed} of ${n} part${n === 1 ? '' : 's'} on ${sheets} sheet${sheets === 1 ? '' : 's'}.`);
-    if (result.unplaced > 0) {
-      log('warn', `${result.unplaced} part${result.unplaced === 1 ? '' : 's'} could not be placed on this sheet size.`);
+  // Whole generation scored — apply the convergence rule, then breed or finish.
+  gaGen++;
+  if (gaGenImproved) gaStall = 0; else gaStall++;
+  if (gaStall >= STALL_LIMIT || gaGen >= GENERATION_CAP) { finalize(); return; }
+  gaGenImproved = false;
+  ga.generation();
+  setTimeout(evalNext, 0);
+}
+
+function finalize() {
+  const n = gaN;
+  if (gaBestPlacements && gaBestPlacements.length > 0) {
+    postPlacement(gaBestPlacements, true);
+    const placed = n - gaBestUnplaced;
+    const sheets = gaBestPlacements.length;
+    log('success', `Done — placed ${placed} of ${n} part${n === 1 ? '' : 's'} on ${sheets} sheet${sheets === 1 ? '' : 's'} after ${gaGen} generation${gaGen === 1 ? '' : 's'}.`);
+    if (gaBestUnplaced > 0) {
+      log('warn', `${gaBestUnplaced} part${gaBestUnplaced === 1 ? '' : 's'} could not be placed on this sheet size.`);
     }
-    self.postMessage({ type: 'done', placed, unplaced: result.unplaced });
+    self.postMessage({ type: 'done', placed, unplaced: gaBestUnplaced });
   } else {
     log('error', 'No parts could be placed — check that parts fit within the sheet margins.');
     self.postMessage({ type: 'done', placed: 0, unplaced: n });
