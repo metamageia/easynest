@@ -408,7 +408,8 @@ function wireSettings() {
     });
   }
   els.rotations.addEventListener('change', () => {
-    engine.updateSettings({ rotations: parseInt(els.rotations.value, 10) || 4 });
+    const v = els.rotations.value; // 'auto' or an integer, mirroring the cores control
+    engine.updateSettings({ rotations: v === 'auto' ? 'auto' : (parseInt(v, 10) || 4) });
   });
   els.cores.addEventListener('change', () => {
     const v = els.cores.value;

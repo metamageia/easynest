@@ -23,6 +23,11 @@ import { toPoints } from './units.js';
 // just on the slow path, exactly as it did before this optimization.
 const CLIPPER_LO_RANGE = 47453132;
 const CLIPPER_MAX_SCALE = 10000000;
+
+// Finest granularity 'auto' rotation mode explores. 8 (45°) covers the useful
+// range and stays a single nested ladder [2,4,8] off one NFP cache; 30° (12) is
+// not nested with 45°, so it remains a deliberate explicit choice, not part of Auto.
+const AUTO_ROTATION_CAP = 8;
 function resolveClipperScale(sheetPt) {
   const maxCoord = Math.max(1, 3 * (sheetPt.usableW + sheetPt.usableH));
   const scale = Math.floor((CLIPPER_LO_RANGE * 0.85) / maxCoord);
@@ -61,11 +66,18 @@ export function buildJob(parts, sheetPt, settings) {
     height: sheetPt.usableH,
   };
 
+  // 'auto' races a ladder of rotation granularities (see the worker) up to this
+  // finest ceiling; an explicit number runs that single granularity. The cap
+  // feeds NFP-cache building either way, so Auto's ceiling is its cache cost.
+  const rotationAuto = settings.rotations === 'auto';
+  const rotations = rotationAuto ? AUTO_ROTATION_CAP : Math.max(1, settings.rotations || 4);
+
   const config = {
     clipperScale: resolveClipperScale(sheetPt),
     curveTolerance: 0.3,
     spacing: sheetPt.gap,
-    rotations: Math.max(1, settings.rotations || 4),
+    rotations,
+    rotationAuto,
     populationSize: 10,
     mutationRate: 10,
     useHoles: false,

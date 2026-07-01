@@ -11,7 +11,7 @@ export const DEFAULT_SETTINGS = {
   sheetH: 19,
   margin: 0.25,
   gap: 0.125,
-  rotations: 4,    // rotation granularity for the optimizer (1 = no rotation)
+  rotations: 4,    // rotation granularity: 1 = none, N = fixed steps, 'auto' = race granularities up to 45°
   presetId: '13x19',
   cores: 'auto',   // parallel NFP compute: 'auto' (= detected cores) or a positive integer
   detail: 'balanced', // nesting outline detail: 'tight' | 'balanced' | 'fast'

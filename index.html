@@ -129,7 +129,8 @@
 
       <label class="field">
         <span>Rotation steps <span class="muted">(free yield)</span></span>
-        <select id="rotations">
+        <select id="rotations" title="Auto tries 0/180°, 90° and 45° and keeps whichever nests tightest. A fixed choice runs just that granularity (the optimizer may still pick any of its angles).">
+          <option value="auto">Auto (find best)</option>
           <option value="1">None (0°)</option>
           <option value="2">2 (0/180°)</option>
           <option value="4">4 (90°)</option>

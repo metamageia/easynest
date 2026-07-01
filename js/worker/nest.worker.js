@@ -497,11 +497,15 @@ GeneticAlgorithm.prototype.randomWeightedIndividual = function (exclude) {
 // transfer outweighs the compute, so we stay single-core regardless of setting.
 const PARALLEL_MIN_COST = 200000;
 
-// Evolution stopping rule (convergence): quit once a full generation fails to
-// improve the best layout for STALL_LIMIT consecutive generations. GENERATION_CAP
-// is a hard safety net so a slowly-creeping fitness can't run forever; the user's
-// Stop button ends it any time in between. Lower fitness is better.
-const STALL_LIMIT = 8;
+// Evolution stopping rule (convergence): end a rung once it fails to improve its
+// own best for STALL_LIMIT consecutive generations. GENERATION_CAP is a hard
+// safety net so a slowly-creeping fitness can't run forever; the Stop button ends
+// it any time in between. LADDER_ABANDON_STALL cuts a rung short earlier when it
+// is BEHIND the global best (a coarser rung already did better) and has stalled —
+// no point spending the full budget proving a trailing rung won't catch up. The
+// leading rung still gets the full STALL_LIMIT. Lower fitness is better.
+const STALL_LIMIT = 5;
+const LADDER_ABANDON_STALL = 2;
 const GENERATION_CAP = 100;
 
 let running = false;
@@ -532,6 +536,7 @@ function withDefaults(c) {
     curveTolerance: 0.3,
     spacing: 0,
     rotations: 4,
+    rotationAuto: false,
     populationSize: 10,
     mutationRate: 10,
     useHoles: false,
@@ -770,12 +775,13 @@ function buildNfpCache(jobs, helperCount, onComplete) {
   finish();
 }
 
-// The selected rotation count is a CAP, not a fixed value. Because the discrete
-// angle sets are nested divisors ({0,180} ⊂ {0,90,180,270} ⊂ {0,45,…}), a bigger
-// set is a strict superset — yet under a bounded search it can converge WORSE,
-// as the extra angles dilute the budget on options that don't help. So we race
-// each granularity that divides the cap (coarse→fine) and keep the global best,
-// automatically discovering the rotation count that actually nests tightest.
+// In 'auto' mode the rotation setting is a CAP, not a fixed value. Because the
+// discrete angle sets are nested divisors ({0,180} ⊂ {0,90,180,270} ⊂ {0,45,…}),
+// a bigger set is a strict superset — yet under a bounded search it can converge
+// WORSE, as the extra angles dilute the budget on options that don't help. So we
+// race each granularity that divides the cap (coarse→fine) and keep the global
+// best, discovering the rotation count that nests tightest. An explicit choice
+// skips the ladder and runs that single granularity.
 function rotationLadder(cap) {
   if (cap <= 1) return [1];
   return [2, 4, 8, 12].filter((s) => s <= cap && cap % s === 0);
@@ -787,7 +793,9 @@ function runOnce() {
   if (!running) return;
   const n = tree.length;
   const cap = Math.max(1, config.rotations);
-  log('info', `Starting nest — ${n} part${n === 1 ? '' : 's'}, auto-tuning rotations up to ${cap} step${cap === 1 ? '' : 's'}.`);
+  log('info', config.rotationAuto
+    ? `Starting nest — ${n} part${n === 1 ? '' : 's'}, auto-tuning rotations up to ${cap} steps.`
+    : `Starting nest — ${n} part${n === 1 ? '' : 's'}, ${cap} rotation step${cap === 1 ? '' : 's'}.`);
 
   // Largest-area-first ordering seeds every rung's population[0].
   gaAdam = tree.slice(0);
@@ -807,7 +815,8 @@ function runOnce() {
     gaBestPlacements = null;
     gaBestUnplaced = n;
     gaBestRot = 0;
-    gaLadder = rotationLadder(cap);
+    // Auto races the nested ladder up to the cap; an explicit choice is one rung.
+    gaLadder = config.rotationAuto ? rotationLadder(cap) : [cap];
     gaLadderIdx = 0;
     log('info', 'Placing parts…');
     startRung();
@@ -882,8 +891,14 @@ function evalNext() {
   // to the next rung of the rotation ladder.
   gaGen++;
   if (gaGenImproved) gaStall = 0; else gaStall++;
-  if (gaStall >= STALL_LIMIT || gaGen >= GENERATION_CAP) { gaLadderIdx++; startRung(); return; }
   gaGenImproved = false;
+
+  // A rung that's still behind the global best AND has stopped improving is
+  // abandoned early (LADDER_ABANDON_STALL); the leading rung — the one holding
+  // the global best — gets the full STALL_LIMIT before we call it converged.
+  const behind = gaRungBest > gaBestFitness;
+  const stallLimit = behind ? LADDER_ABANDON_STALL : STALL_LIMIT;
+  if (gaStall >= stallLimit || gaGen >= GENERATION_CAP) { gaLadderIdx++; startRung(); return; }
   ga.generation();
   setTimeout(evalNext, 0);
 }
