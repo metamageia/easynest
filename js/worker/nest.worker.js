@@ -469,11 +469,16 @@ GeneticAlgorithm.prototype.randomWeightedIndividual = function (exclude) {
 // --- worker driver --------------------------------------------------------
 //
 // A run is a genetic search: seed the population with the area-sorted greedy
-// ordering, precompute the NFP cache ONCE (all sources × all rotations), then
-// evolve — placing each candidate ordering/rotation against that shared cache,
-// keeping the best, and streaming the best-so-far layout as it improves. It
-// stops on convergence (STALL_LIMIT stale generations), a generation cap, or an
-// explicit `stop`. Each streamed layout is a complete, exportable result.
+// ordering, precompute the NFP cache ONCE (all sources × all rotations, at the
+// finest granularity the rotation cap allows), then evolve — placing each
+// candidate ordering/rotation against that shared cache, keeping the best, and
+// streaming the best-so-far layout as it improves. A single evolution stops on
+// convergence (STALL_LIMIT stale generations), a generation cap, or `stop`.
+//
+// The rotation setting is treated as a CAP: we race a ladder of granularities
+// that divide it (coarse→fine) against the one shared cache, keeping the global
+// best, so the tightest-nesting rotation count is found automatically rather
+// than guessed. Each streamed layout is a complete, exportable result.
 //
 // The whole reason multi-start beats a single greedy pass cheaply is that the
 // O(n²) no-fit-polygon precompute (the heavy, embarrassingly-parallel part)
@@ -505,12 +510,14 @@ let sourcePoly = null;      // Map<sourceId, representativePolygon> for NFP comp
 let coreCount = 1;          // total cores this run may use (coordinator + helpers)
 let activeHelpers = [];     // live nested helper workers (for teardown)
 
-// Evolution state (set up in startEvolution, advanced in evalNext).
-let ga = null;              // the running GeneticAlgorithm
-let gaCache = null;         // shared NFP cache reused by every candidate
+// Evolution state (set up in startLadder/startRung, advanced in evalNext).
+let ga = null;              // the running GeneticAlgorithm for the current rung
+let gaCache = null;         // shared NFP cache (built once at the rotation cap)
 let gaN = 0;                // total parts, for done-reporting
-let gaBestFitness = Infinity, gaBestPlacements = null, gaBestUnplaced = 0;
-let gaGen = 0, gaStall = 0, gaGenImproved = false;
+let gaAdam = null;          // area-sorted base ordering, reused across rungs
+let gaLadder = [], gaLadderIdx = 0; // rotation counts to try, ascending, + cursor
+let gaBestFitness = Infinity, gaBestPlacements = null, gaBestUnplaced = 0, gaBestRot = 0;
+let gaGen = 0, gaStall = 0, gaGenImproved = false, gaRungBest = Infinity; // reset per rung
 
 // Post a structured log line to the main thread.
 // level: 'info' | 'success' | 'warn' | 'error'
@@ -763,16 +770,28 @@ function buildNfpCache(jobs, helperCount, onComplete) {
   finish();
 }
 
-// Build the GA population + the shared NFP cache, then kick off the evolution.
+// The selected rotation count is a CAP, not a fixed value. Because the discrete
+// angle sets are nested divisors ({0,180} ⊂ {0,90,180,270} ⊂ {0,45,…}), a bigger
+// set is a strict superset — yet under a bounded search it can converge WORSE,
+// as the extra angles dilute the budget on options that don't help. So we race
+// each granularity that divides the cap (coarse→fine) and keep the global best,
+// automatically discovering the rotation count that actually nests tightest.
+function rotationLadder(cap) {
+  if (cap <= 1) return [1];
+  return [2, 4, 8, 12].filter((s) => s <= cap && cap % s === 0);
+}
+
+// Build the shared NFP cache (once, at the finest = cap granularity), then race
+// the rotation ladder against it.
 function runOnce() {
   if (!running) return;
   const n = tree.length;
-  log('info', `Starting nest — ${n} part${n === 1 ? '' : 's'}, up to ${Math.max(1, config.rotations)} rotation${config.rotations === 1 ? '' : 's'}.`);
+  const cap = Math.max(1, config.rotations);
+  log('info', `Starting nest — ${n} part${n === 1 ? '' : 's'}, auto-tuning rotations up to ${cap} step${cap === 1 ? '' : 's'}.`);
 
-  // Largest-area-first ordering seeds population[0]; the rest are mutations of it.
-  const adam = tree.slice(0);
-  adam.sort((a, b) => Math.abs(GeometryUtil.polygonArea(b)) - Math.abs(GeometryUtil.polygonArea(a)));
-  ga = new GeneticAlgorithm(adam, binPolygon, config);
+  // Largest-area-first ordering seeds every rung's population[0].
+  gaAdam = tree.slice(0);
+  gaAdam.sort((a, b) => Math.abs(GeometryUtil.polygonArea(b)) - Math.abs(GeometryUtil.polygonArea(a)));
 
   const jobs = buildNfpJobs();
   const helperCount = (coreCount > 1 && jobs.length > 1 && estimateNfpCost(jobs) >= PARALLEL_MIN_COST)
@@ -782,7 +801,16 @@ function runOnce() {
 
   buildNfpCache(jobs, helperCount, (cache) => {
     if (!running) return;
-    startEvolution(cache, n);
+    gaCache = cache;
+    gaN = n;
+    gaBestFitness = Infinity;
+    gaBestPlacements = null;
+    gaBestUnplaced = n;
+    gaBestRot = 0;
+    gaLadder = rotationLadder(cap);
+    gaLadderIdx = 0;
+    log('info', 'Placing parts…');
+    startRung();
   });
 }
 
@@ -791,16 +819,21 @@ function runOnce() {
 // individual per macrotask (setTimeout 0). Yielding between them lets `stop`
 // messages land and lets the main thread paint each streamed best-so-far layout.
 
-function startEvolution(cache, n) {
-  gaCache = cache;
-  gaN = n;
-  gaBestFitness = Infinity;
-  gaBestPlacements = null;
-  gaBestUnplaced = n;
+// Begin the GA search for the current rung (or finish once the ladder is spent).
+// Each rung gets a fresh population restricted to its angle set; the global best
+// (gaBest*) carries across rungs, so a finer rung only wins if it truly packs
+// tighter — otherwise the shown layout is untouched.
+function startRung() {
+  if (!running) return;
+  if (gaLadderIdx >= gaLadder.length) { finalize(); return; }
+  const rot = gaLadder[gaLadderIdx];
+  const rungConfig = Object.assign({}, config, { rotations: rot });
+  ga = new GeneticAlgorithm(gaAdam.slice(0), binPolygon, rungConfig);
   gaGen = 0;
   gaStall = 0;
   gaGenImproved = false;
-  log('info', 'Placing parts…');
+  gaRungBest = Infinity;
+  if (gaLadder.length > 1) log('info', `Searching with up to ${rot} rotation${rot === 1 ? '' : 's'}…`);
   evalNext();
 }
 
@@ -828,21 +861,28 @@ function evalNext() {
       return;
     }
     ind.fitness = result.fitness;
-    if (result.placements.length > 0 && result.fitness < gaBestFitness) {
-      gaBestFitness = result.fitness;
-      gaBestPlacements = result.placements;
-      gaBestUnplaced = result.unplaced;
-      gaGenImproved = true;
-      postPlacement(gaBestPlacements, false); // complete, exportable best-so-far
+    if (result.placements.length > 0) {
+      // Rung-LOCAL progress drives convergence, so each granularity gets a fair
+      // search even before it beats a coarser rung's global best.
+      if (result.fitness < gaRungBest) { gaRungBest = result.fitness; gaGenImproved = true; }
+      // GLOBAL best drives the shown/exported layout — it never regresses.
+      if (result.fitness < gaBestFitness) {
+        gaBestFitness = result.fitness;
+        gaBestPlacements = result.placements;
+        gaBestUnplaced = result.unplaced;
+        gaBestRot = gaLadder[gaLadderIdx];
+        postPlacement(gaBestPlacements, false); // complete, exportable best-so-far
+      }
     }
     setTimeout(evalNext, 0);
     return;
   }
 
-  // Whole generation scored — apply the convergence rule, then breed or finish.
+  // Whole generation scored — apply the convergence rule, then breed or move on
+  // to the next rung of the rotation ladder.
   gaGen++;
   if (gaGenImproved) gaStall = 0; else gaStall++;
-  if (gaStall >= STALL_LIMIT || gaGen >= GENERATION_CAP) { finalize(); return; }
+  if (gaStall >= STALL_LIMIT || gaGen >= GENERATION_CAP) { gaLadderIdx++; startRung(); return; }
   gaGenImproved = false;
   ga.generation();
   setTimeout(evalNext, 0);
@@ -854,7 +894,8 @@ function finalize() {
     postPlacement(gaBestPlacements, true);
     const placed = n - gaBestUnplaced;
     const sheets = gaBestPlacements.length;
-    log('success', `Done — placed ${placed} of ${n} part${n === 1 ? '' : 's'} on ${sheets} sheet${sheets === 1 ? '' : 's'} after ${gaGen} generation${gaGen === 1 ? '' : 's'}.`);
+    const rotNote = gaLadder.length > 1 ? ` — best with ${gaBestRot} rotation step${gaBestRot === 1 ? '' : 's'}` : '';
+    log('success', `Done — placed ${placed} of ${n} part${n === 1 ? '' : 's'} on ${sheets} sheet${sheets === 1 ? '' : 's'}${rotNote}.`);
     if (gaBestUnplaced > 0) {
       log('warn', `${gaBestUnplaced} part${gaBestUnplaced === 1 ? '' : 's'} could not be placed on this sheet size.`);
     }
