@@ -191,6 +191,116 @@ function computeNfp(pair, config) {
 
 // --- placement (ported from SVGnest placementworker.js) ------------------
 
+// The single source of truth for "where can this part legally go?" — the best
+// collision-free spot for `path` given the parts already fixed on this sheet
+// (`placed` + `placements`), gravity-biased up-left (smallest weighted bbox).
+// Returns {x,y,id,rotation} or null if it can't fit. Shared by the greedy placer
+// AND the compaction pass, so any position either produces is provably inside the
+// bin and non-overlapping (it's a vertex of binNFP minus the union of placed NFPs).
+function feasiblePosition(path, placed, placements, config, nfpCache) {
+  const insideKey = JSON.stringify({ A: -1, B: path.source, inside: true, Arotation: 0, Brotation: path.rotation });
+  const binNfp = nfpCache[insideKey];
+  if (!binNfp || binNfp.length === 0) return null; // can't fit the empty sheet
+
+  for (let j = 0; j < placed.length; j++) {
+    const k = JSON.stringify({ A: placed[j].source, B: path.source, inside: false, Arotation: placed[j].rotation, Brotation: path.rotation });
+    if (!nfpCache[k]) return null; // missing a required pairwise NFP
+  }
+
+  if (placed.length === 0) {
+    let position = null;
+    for (let j = 0; j < binNfp.length; j++) {
+      for (let k = 0; k < binNfp[j].length; k++) {
+        if (position === null || binNfp[j][k].x - path[0].x < position.x) {
+          position = { x: binNfp[j][k].x - path[0].x, y: binNfp[j][k].y - path[0].y, id: path.id, rotation: path.rotation };
+        }
+      }
+    }
+    return position;
+  }
+
+  const clipperBinNfp = [];
+  for (let j = 0; j < binNfp.length; j++) clipperBinNfp.push(toClipperCoordinates(binNfp[j]));
+  ClipperLib.JS.ScaleUpPaths(clipperBinNfp, config.clipperScale);
+
+  let clipper = new ClipperLib.Clipper();
+  const combinedNfp = new ClipperLib.Paths();
+  for (let j = 0; j < placed.length; j++) {
+    const k = JSON.stringify({ A: placed[j].source, B: path.source, inside: false, Arotation: placed[j].rotation, Brotation: path.rotation });
+    const nfp = nfpCache[k];
+    if (!nfp) continue;
+    for (let m2 = 0; m2 < nfp.length; m2++) {
+      const clone = toClipperCoordinates(nfp[m2]);
+      for (let m = 0; m < clone.length; m++) { clone[m].X += placements[j].x; clone[m].Y += placements[j].y; }
+      ClipperLib.JS.ScaleUpPath(clone, config.clipperScale);
+      const cleaned = ClipperLib.Clipper.CleanPolygon(clone, 0.0001 * config.clipperScale);
+      const area = Math.abs(ClipperLib.Clipper.Area(cleaned));
+      if (cleaned.length > 2 && area > 0.1 * config.clipperScale * config.clipperScale) {
+        clipper.AddPath(cleaned, ClipperLib.PolyType.ptSubject, true);
+      }
+    }
+  }
+  if (!clipper.Execute(ClipperLib.ClipType.ctUnion, combinedNfp, ClipperLib.PolyFillType.pftNonZero, ClipperLib.PolyFillType.pftNonZero)) return null;
+
+  let finalNfp = new ClipperLib.Paths();
+  clipper = new ClipperLib.Clipper();
+  clipper.AddPaths(combinedNfp, ClipperLib.PolyType.ptClip, true);
+  clipper.AddPaths(clipperBinNfp, ClipperLib.PolyType.ptSubject, true);
+  if (!clipper.Execute(ClipperLib.ClipType.ctDifference, finalNfp, ClipperLib.PolyFillType.pftNonZero, ClipperLib.PolyFillType.pftNonZero)) return null;
+
+  finalNfp = ClipperLib.Clipper.CleanPolygons(finalNfp, 0.0001 * config.clipperScale);
+  for (let j = 0; j < finalNfp.length; j++) {
+    const area = Math.abs(ClipperLib.Clipper.Area(finalNfp[j]));
+    if (finalNfp[j].length < 3 || area < 0.1 * config.clipperScale * config.clipperScale) { finalNfp.splice(j, 1); j--; }
+  }
+  if (!finalNfp || finalNfp.length === 0) return null;
+
+  const f = [];
+  for (let j = 0; j < finalNfp.length; j++) f.push(toNestCoordinates(finalNfp[j], config.clipperScale));
+  finalNfp = f;
+
+  // Placed-parts extent is constant across candidate vertices — accumulate once.
+  let pminx = Infinity, pminy = Infinity, pmaxx = -Infinity, pmaxy = -Infinity;
+  for (let m = 0; m < placed.length; m++) {
+    for (let nn = 0; nn < placed[m].length; nn++) {
+      const px = placed[m][nn].x + placements[m].x;
+      const py = placed[m][nn].y + placements[m].y;
+      if (px < pminx) pminx = px;
+      if (px > pmaxx) pmaxx = px;
+      if (py < pminy) pminy = py;
+      if (py > pmaxy) pmaxy = py;
+    }
+  }
+
+  // Gravity heuristic: smallest weighted bounding box (2·width + height), ties
+  // broken toward the left edge — matches SVGnest.
+  let position = null, minarea = null, minx = null;
+  for (let j = 0; j < finalNfp.length; j++) {
+    const nf = finalNfp[j];
+    if (Math.abs(GeometryUtil.polygonArea(nf)) < 2) continue;
+    for (let k = 0; k < nf.length; k++) {
+      const shiftvector = { x: nf[k].x - path[0].x, y: nf[k].y - path[0].y, id: path.id, rotation: path.rotation };
+      let minX = pminx, minY = pminy, maxX = pmaxx, maxY = pmaxy;
+      for (let m = 0; m < path.length; m++) {
+        const x = path[m].x + shiftvector.x, y = path[m].y + shiftvector.y;
+        if (x < minX) minX = x;
+        if (x > maxX) maxX = x;
+        if (y < minY) minY = y;
+        if (y > maxY) maxY = y;
+      }
+      const width = maxX - minX, height = maxY - minY;
+      const area = width * 2 + height;
+      if (minarea === null || area < minarea ||
+          (GeometryUtil.almostEqual(minarea, area) && (minx === null || shiftvector.x < minx))) {
+        minarea = area;
+        position = shiftvector;
+        minx = shiftvector.x;
+      }
+    }
+  }
+  return position;
+}
+
 function placePaths(binPolygon, paths, config, nfpCache, onProgress) {
   if (!binPolygon) return null;
   const rotated = [];
@@ -206,7 +316,6 @@ function placePaths(binPolygon, paths, config, nfpCache, onProgress) {
   const allplacements = [];
   let fitness = 0;
   const binarea = Math.abs(GeometryUtil.polygonArea(binPolygon));
-  let key, nfp;
   let lastSheetFill = 0; // normalized footprint of the most recently filled sheet
 
   while (paths.length > 0) {
@@ -215,136 +324,11 @@ function placePaths(binPolygon, paths, config, nfpCache, onProgress) {
 
     for (let i = 0; i < paths.length; i++) {
       const path = paths[i];
-
-      // NFP cache keys are by SHAPE (source) + rotation, not per-copy id, so
-      // identical copies reuse the same NFP. Placement ids below stay per-copy.
-      key = JSON.stringify({ A: -1, B: path.source, inside: true, Arotation: 0, Brotation: path.rotation });
-      const binNfp = nfpCache[key];
-      if (!binNfp || binNfp.length === 0) continue; // unplaceable on an empty sheet
-
-      let error = false;
-      for (let j = 0; j < placed.length; j++) {
-        key = JSON.stringify({ A: placed[j].source, B: path.source, inside: false, Arotation: placed[j].rotation, Brotation: path.rotation });
-        if (!nfpCache[key]) { error = true; break; }
-      }
-      if (error) continue;
-
-      let position = null;
-      if (placed.length === 0) {
-        for (let j = 0; j < binNfp.length; j++) {
-          for (let k = 0; k < binNfp[j].length; k++) {
-            if (position === null || binNfp[j][k].x - path[0].x < position.x) {
-              position = {
-                x: binNfp[j][k].x - path[0].x,
-                y: binNfp[j][k].y - path[0].y,
-                id: path.id, rotation: path.rotation,
-              };
-            }
-          }
-        }
-        placements.push(position);
-        placed.push(path);
-        if (onProgress) onProgress(allplacements.concat([placements]));
-        continue;
-      }
-
-      const clipperBinNfp = [];
-      for (let j = 0; j < binNfp.length; j++) clipperBinNfp.push(toClipperCoordinates(binNfp[j]));
-      ClipperLib.JS.ScaleUpPaths(clipperBinNfp, config.clipperScale);
-
-      let clipper = new ClipperLib.Clipper();
-      const combinedNfp = new ClipperLib.Paths();
-      for (let j = 0; j < placed.length; j++) {
-        key = JSON.stringify({ A: placed[j].source, B: path.source, inside: false, Arotation: placed[j].rotation, Brotation: path.rotation });
-        nfp = nfpCache[key];
-        if (!nfp) continue;
-        for (let k = 0; k < nfp.length; k++) {
-          const clone = toClipperCoordinates(nfp[k]);
-          for (let m = 0; m < clone.length; m++) {
-            clone[m].X += placements[j].x;
-            clone[m].Y += placements[j].y;
-          }
-          ClipperLib.JS.ScaleUpPath(clone, config.clipperScale);
-          const cleaned = ClipperLib.Clipper.CleanPolygon(clone, 0.0001 * config.clipperScale);
-          const area = Math.abs(ClipperLib.Clipper.Area(cleaned));
-          if (cleaned.length > 2 && area > 0.1 * config.clipperScale * config.clipperScale) {
-            clipper.AddPath(cleaned, ClipperLib.PolyType.ptSubject, true);
-          }
-        }
-      }
-      if (!clipper.Execute(ClipperLib.ClipType.ctUnion, combinedNfp, ClipperLib.PolyFillType.pftNonZero, ClipperLib.PolyFillType.pftNonZero)) continue;
-
-      let finalNfp = new ClipperLib.Paths();
-      clipper = new ClipperLib.Clipper();
-      clipper.AddPaths(combinedNfp, ClipperLib.PolyType.ptClip, true);
-      clipper.AddPaths(clipperBinNfp, ClipperLib.PolyType.ptSubject, true);
-      if (!clipper.Execute(ClipperLib.ClipType.ctDifference, finalNfp, ClipperLib.PolyFillType.pftNonZero, ClipperLib.PolyFillType.pftNonZero)) continue;
-
-      finalNfp = ClipperLib.Clipper.CleanPolygons(finalNfp, 0.0001 * config.clipperScale);
-      for (let j = 0; j < finalNfp.length; j++) {
-        const area = Math.abs(ClipperLib.Clipper.Area(finalNfp[j]));
-        if (finalNfp[j].length < 3 || area < 0.1 * config.clipperScale * config.clipperScale) {
-          finalNfp.splice(j, 1); j--;
-        }
-      }
-      if (!finalNfp || finalNfp.length === 0) continue;
-
-      const f = [];
-      for (let j = 0; j < finalNfp.length; j++) f.push(toNestCoordinates(finalNfp[j], config.clipperScale));
-      finalNfp = f;
-
-      // Choose the placement with the smallest weighted bounding box (gravity
-      // toward the left edge), matching SVGnest's heuristic.
-      //
-      // The already-placed parts' extent is constant while we evaluate this one
-      // candidate, so accumulate its bounds ONCE here instead of rebuilding the
-      // full point list for every candidate NFP vertex (SVGnest's hot-loop
-      // waste — this is O(placedPoints) once, not per vertex).
-      let pminx = Infinity, pminy = Infinity, pmaxx = -Infinity, pmaxy = -Infinity;
-      for (let m = 0; m < placed.length; m++) {
-        for (let nn = 0; nn < placed[m].length; nn++) {
-          const px = placed[m][nn].x + placements[m].x;
-          const py = placed[m][nn].y + placements[m].y;
-          if (px < pminx) pminx = px;
-          if (px > pmaxx) pmaxx = px;
-          if (py < pminy) pminy = py;
-          if (py > pmaxy) pmaxy = py;
-        }
-      }
-
-      let minarea = null, minx = null;
-      for (let j = 0; j < finalNfp.length; j++) {
-        const nf = finalNfp[j];
-        if (Math.abs(GeometryUtil.polygonArea(nf)) < 2) continue;
-        for (let k = 0; k < nf.length; k++) {
-          const shiftvector = {
-            x: nf[k].x - path[0].x, y: nf[k].y - path[0].y,
-            id: path.id, rotation: path.rotation,
-          };
-          // Extend the constant placed-parts bounds by this candidate's points.
-          let minX = pminx, minY = pminy, maxX = pmaxx, maxY = pmaxy;
-          for (let m = 0; m < path.length; m++) {
-            const x = path[m].x + shiftvector.x, y = path[m].y + shiftvector.y;
-            if (x < minX) minX = x;
-            if (x > maxX) maxX = x;
-            if (y < minY) minY = y;
-            if (y > maxY) maxY = y;
-          }
-          const width = maxX - minX, height = maxY - minY;
-          const area = width * 2 + height;
-          if (minarea === null || area < minarea ||
-              (GeometryUtil.almostEqual(minarea, area) && (minx === null || shiftvector.x < minx))) {
-            minarea = area;
-            position = shiftvector;
-            minx = shiftvector.x;
-          }
-        }
-      }
-      if (position) {
-        placed.push(path);
-        placements.push(position);
-        if (onProgress) onProgress(allplacements.concat([placements]));
-      }
+      const position = feasiblePosition(path, placed, placements, config, nfpCache);
+      if (!position) continue; // can't fit the empty sheet / no free region here
+      placed.push(path);
+      placements.push(position);
+      if (onProgress) onProgress(allplacements.concat([placements]));
     }
 
     for (let i = 0; i < placed.length; i++) {
@@ -387,13 +371,31 @@ function placePaths(binPolygon, paths, config, nfpCache, onProgress) {
 function GeneticAlgorithm(adam, bin, config) {
   this.config = config;
   this.binBounds = GeometryUtil.getPolygonBounds(bin);
+  // Seed the elite with each part at its TIGHTEST-footprint orientation, not a
+  // random one — a cold random seed is why finer rungs started "way out of
+  // utilization". Mutation still uses randomAngle for diversity.
   const angles = [];
-  for (let i = 0; i < adam.length; i++) angles.push(this.randomAngle(adam[i]));
+  for (let i = 0; i < adam.length; i++) angles.push(this.bestAngle(adam[i]));
   this.population = [{ placement: adam, rotation: angles }];
   while (this.population.length < config.populationSize) {
     this.population.push(this.mutate(this.population[0]));
   }
 }
+// The allowed angle that fits the bin with the smallest bounding-box area — a
+// strong deterministic starting orientation (ties/no-fit fall back to 0°).
+GeneticAlgorithm.prototype.bestAngle = function (part) {
+  const steps = Math.max(this.config.rotations, 1);
+  let best = 0, bestScore = Infinity;
+  for (let i = 0; i < steps; i++) {
+    const angle = i * (360 / steps);
+    const rp = GeometryUtil.rotatePolygon(part, angle);
+    const fits = rp.width < this.binBounds.width && rp.height < this.binBounds.height;
+    // Fitting orientations rank ahead of non-fitting; then smallest footprint.
+    const score = (fits ? 0 : 1e12) + rp.width * rp.height;
+    if (score < bestScore) { bestScore = score; best = angle; }
+  }
+  return best;
+};
 GeneticAlgorithm.prototype.randomAngle = function (part) {
   const angleList = [];
   for (let i = 0; i < Math.max(this.config.rotations, 1); i++) {
@@ -508,6 +510,11 @@ const STALL_LIMIT = 5;
 const LADDER_ABANDON_STALL = 2;
 const GENERATION_CAP = 100;
 
+// Post-search compaction: gravity-slide passes over the FINAL best layout to
+// close gaps and try to empty the last sheet. Set 0 to disable. Runs once at the
+// end, so a few passes is cheap relative to the whole search.
+const COMPACT_PASSES = 4;
+
 let running = false;
 let tree = null, binPolygon = null, config = null;
 let sourcePoly = null;      // Map<sourceId, representativePolygon> for NFP compute
@@ -521,7 +528,9 @@ let gaN = 0;                // total parts, for done-reporting
 let gaAdam = null;          // area-sorted base ordering, reused across rungs
 let gaLadder = [], gaLadderIdx = 0; // rotation counts to try, ascending, + cursor
 let gaBestFitness = Infinity, gaBestPlacements = null, gaBestUnplaced = 0, gaBestRot = 0;
+let gaBestGene = null;      // {placement,rotation} of the global best — warm-starts finer rungs
 let gaGen = 0, gaStall = 0, gaGenImproved = false, gaRungBest = Infinity; // reset per rung
+let gaRungWarm = false, gaRungImprovedEver = false; // reset per rung (warm-start / probation)
 
 // Post a structured log line to the main thread.
 // level: 'info' | 'success' | 'warn' | 'error'
@@ -815,6 +824,7 @@ function runOnce() {
     gaBestPlacements = null;
     gaBestUnplaced = n;
     gaBestRot = 0;
+    gaBestGene = null;
     // Auto races the nested ladder up to the cap; an explicit choice is one rung.
     gaLadder = config.rotationAuto ? rotationLadder(cap) : [cap];
     gaLadderIdx = 0;
@@ -838,10 +848,26 @@ function startRung() {
   const rot = gaLadder[gaLadderIdx];
   const rungConfig = Object.assign({}, config, { rotations: rot });
   ga = new GeneticAlgorithm(gaAdam.slice(0), binPolygon, rungConfig);
+
+  // WARM-START: a finer rung's angle set is a superset of the coarser rungs', so
+  // the running global best is a valid individual here — inject it as the elite
+  // (its fitness carries over unchanged). The finer rung therefore starts AT the
+  // incumbent and can only search the EXTRA angles for a genuine improvement,
+  // instead of climbing out of a cold random seed.
+  gaRungWarm = !!gaBestGene;
+  if (gaRungWarm) {
+    ga.population[0] = {
+      placement: gaBestGene.placement.slice(0),
+      rotation: gaBestGene.rotation.slice(0),
+      fitness: gaBestFitness,
+    };
+  }
   gaGen = 0;
   gaStall = 0;
   gaGenImproved = false;
-  gaRungBest = Infinity;
+  gaRungImprovedEver = false;
+  // A warm rung already holds the incumbent, so its rung-best starts there.
+  gaRungBest = gaRungWarm ? gaBestFitness : Infinity;
   if (gaLadder.length > 1) log('info', `Searching with up to ${rot} rotation${rot === 1 ? '' : 's'}…`);
   evalNext();
 }
@@ -872,14 +898,20 @@ function evalNext() {
     ind.fitness = result.fitness;
     if (result.placements.length > 0) {
       // Rung-LOCAL progress drives convergence, so each granularity gets a fair
-      // search even before it beats a coarser rung's global best.
-      if (result.fitness < gaRungBest) { gaRungBest = result.fitness; gaGenImproved = true; }
-      // GLOBAL best drives the shown/exported layout — it never regresses.
+      // search. For a warm rung this means beating the inherited incumbent.
+      if (result.fitness < gaRungBest) {
+        gaRungBest = result.fitness;
+        gaGenImproved = true;
+        gaRungImprovedEver = true;
+      }
+      // GLOBAL best drives the shown/exported layout — it never regresses. Capture
+      // the winning GENE too, so the next (finer) rung can warm-start from it.
       if (result.fitness < gaBestFitness) {
         gaBestFitness = result.fitness;
         gaBestPlacements = result.placements;
         gaBestUnplaced = result.unplaced;
         gaBestRot = gaLadder[gaLadderIdx];
+        gaBestGene = { placement: ind.placement.slice(0), rotation: ind.rotation.slice(0) };
         postPlacement(gaBestPlacements, false); // complete, exportable best-so-far
       }
     }
@@ -893,19 +925,112 @@ function evalNext() {
   if (gaGenImproved) gaStall = 0; else gaStall++;
   gaGenImproved = false;
 
-  // A rung that's still behind the global best AND has stopped improving is
-  // abandoned early (LADDER_ABANDON_STALL); the leading rung — the one holding
-  // the global best — gets the full STALL_LIMIT before we call it converged.
-  const behind = gaRungBest > gaBestFitness;
-  const stallLimit = behind ? LADDER_ABANDON_STALL : STALL_LIMIT;
+  // A warm-started finer rung starts tied with the global best, so it's on a
+  // short "probation": if its extra angles produce NO improvement within
+  // LADDER_ABANDON_STALL stalled generations, abandon it. The moment it improves
+  // even once (a real finer-rotation win) it earns the full STALL_LIMIT to
+  // converge — as does the first rung, which has no incumbent to warm-start from.
+  const probation = gaRungWarm && !gaRungImprovedEver;
+  const stallLimit = probation ? LADDER_ABANDON_STALL : STALL_LIMIT;
   if (gaStall >= stallLimit || gaGen >= GENERATION_CAP) { gaLadderIdx++; startRung(); return; }
   ga.generation();
   setTimeout(evalNext, 0);
 }
 
+// --- compaction -----------------------------------------------------------
+// A post-search pass over the FINAL best layout. It reuses feasiblePosition (the
+// same trusted "where can this legally go" used by the placer), so every move it
+// makes is inside the bin and non-overlapping BY CONSTRUCTION. Two steps:
+//   1. within-sheet gravity slide — pull each part to a tighter spot, accepting
+//      a move only if it shrinks that sheet's bounding box (monotone: never worse,
+//      never oscillates), which is exactly the last-sheet footprint our fitness
+//      already rewards;
+//   2. last-sheet reflow — try to relocate every part on the final partial sheet
+//      onto earlier sheets; if it empties, drop it — a whole sheet of material saved.
+
+// Rebuild a placement's rotated outline (tagged for feasiblePosition/NFP lookup).
+function placedPoly(pl) {
+  const r = rotatePolygon(tree[pl.id], pl.rotation);
+  r.source = tree[pl.id].source;
+  r.rotation = pl.rotation;
+  r.id = pl.id;
+  return r;
+}
+
+// Bounding-box area of a set of placed parts (the footprint we minimize).
+function layoutFootprint(parts, positions) {
+  let minx = Infinity, miny = Infinity, maxx = -Infinity, maxy = -Infinity;
+  for (let i = 0; i < parts.length; i++) {
+    for (let n = 0; n < parts[i].length; n++) {
+      const x = parts[i][n].x + positions[i].x, y = parts[i][n].y + positions[i].y;
+      if (x < minx) minx = x;
+      if (x > maxx) maxx = x;
+      if (y < miny) miny = y;
+      if (y > maxy) maxy = y;
+    }
+  }
+  return (maxx - minx) * (maxy - miny);
+}
+
+function compactLayout(sheets) {
+  if (!sheets || sheets.length === 0) return sheets;
+
+  const work = sheets.map((sheet) => ({
+    parts: sheet.map(placedPoly),
+    positions: sheet.map((pl) => ({ x: pl.x, y: pl.y, id: pl.id, rotation: pl.rotation })),
+  }));
+
+  // 1) Within-sheet gravity compaction.
+  for (const sheet of work) {
+    for (let pass = 0; pass < COMPACT_PASSES; pass++) {
+      if (!running) return sheets;
+      let moved = false;
+      // Settle top-left parts first for a stable ordering.
+      const order = sheet.parts.map((_, i) => i)
+        .sort((a, b) => (sheet.positions[a].y - sheet.positions[b].y) || (sheet.positions[a].x - sheet.positions[b].x));
+      for (const idx of order) {
+        const others = [], otherPos = [];
+        for (let i = 0; i < sheet.parts.length; i++) {
+          if (i !== idx) { others.push(sheet.parts[i]); otherPos.push(sheet.positions[i]); }
+        }
+        const pos = feasiblePosition(sheet.parts[idx], others, otherPos, config, gaCache);
+        if (!pos) continue;
+        const before = layoutFootprint(sheet.parts, sheet.positions);
+        const saved = sheet.positions[idx];
+        sheet.positions[idx] = pos;
+        if (layoutFootprint(sheet.parts, sheet.positions) < before - 1e-6) moved = true;
+        else sheet.positions[idx] = saved; // reject non-improving move
+      }
+      if (!moved) break;
+    }
+  }
+
+  // 2) Last-sheet reflow onto earlier sheets.
+  if (work.length >= 2 && running) {
+    const last = work[work.length - 1];
+    const keepParts = [], keepPos = [];
+    for (let i = 0; i < last.parts.length; i++) {
+      let moved = false;
+      for (let s = 0; s < work.length - 1 && running; s++) {
+        const pos = feasiblePosition(last.parts[i], work[s].parts, work[s].positions, config, gaCache);
+        if (pos) { work[s].parts.push(last.parts[i]); work[s].positions.push(pos); moved = true; break; }
+      }
+      if (!moved) { keepParts.push(last.parts[i]); keepPos.push(last.positions[i]); }
+    }
+    if (keepParts.length === 0) work.pop();
+    else { last.parts = keepParts; last.positions = keepPos; }
+  }
+
+  return work.map((sheet) => sheet.positions.map((p) => ({ id: p.id, x: p.x, y: p.y, rotation: p.rotation })));
+}
+
 function finalize() {
   const n = gaN;
   if (gaBestPlacements && gaBestPlacements.length > 0) {
+    if (COMPACT_PASSES > 0) {
+      log('info', 'Compacting…');
+      gaBestPlacements = compactLayout(gaBestPlacements);
+    }
     postPlacement(gaBestPlacements, true);
     const placed = n - gaBestUnplaced;
     const sheets = gaBestPlacements.length;
